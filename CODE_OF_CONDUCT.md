@@ -1,5 +1,5 @@
 # Code of Conduct
 
-Be respectful, technical, and constructive. Harassment, personal attacks, discriminatory behavior, and publication of another person's private information are not acceptable.
+Be respectful, technical, and constructive. Keep harassment, personal attacks, discriminatory behavior, and another person's private information out of project spaces.
 
-Project maintainers may edit or remove contributions and participation that violate these expectations. Security-sensitive or private system information should be reported through private channels rather than public issues.
+Project maintainers may edit or remove contributions and participation that violate these expectations. Report security-sensitive or private system information through private channels.

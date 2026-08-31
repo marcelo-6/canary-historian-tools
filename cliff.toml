@@ -1,7 +1,6 @@
-# git-cliff ~ default configuration file
+# git-cliff configuration file
 # https://git-cliff.org/docs/configuration
 #
-# Lines starting with "#" are comments.
 # Configuration options are organized into tables and keys.
 # See documentation for more information on available options.
 
@@ -87,7 +86,7 @@ postprocessors = [
 [git]
 # parse the commits based on https://www.conventionalcommits.org
 conventional_commits = true
-# filter out the commits that are not conventional
+# filter conventional commits only
 filter_unconventional = true
 # process each line of a commit as an individual commit
 split_commits = false
@@ -122,7 +121,7 @@ commit_parsers = [
   # Skip if commit is for changelog generation
   { message = "^chore\\(release\\): prepare ", skip = true },
 ]
-# filter out the commits that are not matched by commit parsers
+# include commits that miss parser rules
 filter_commits = false
 # sort the tags topologically
 topo_order = false

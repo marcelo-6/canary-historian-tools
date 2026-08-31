@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Cross-version Canary Historian Read API benchmark (strict-mode collection-safe).
+    Cross-version Canary Historian Read API benchmark with strict-mode-safe collections.
 
 .DESCRIPTION
     Benchmarks Canary Views Read API data extraction for Canary 23.x through 25.x.
@@ -13,7 +13,7 @@
       5. Benchmarks raw getTagData2 throughput using continuation paging.
       6. Writes CSV/JSON results and a timestamped text log.
 
-    It supports anonymous access plus apiToken, accessToken, or userToken authentication.
+    It supports anonymous access, apiToken, accessToken, and userToken authentication.
     It is compatible with Windows PowerShell 5.1 and PowerShell 7+.
 
 .EXAMPLE
@@ -55,7 +55,7 @@ param(
     [ValidateRange(1, 1000)]
     [int]$CountBatchSize = 100,
 
-    # Canary 23.x cannot represent one absolute TimeSpan over 1000 days.
+    # Canary 23.x rejects some absolute TimeSpan values over 1000 days.
     # Keep this <= 999 so the same request works on old and new versions.
     [ValidateRange(1, 999)]
     [int]$CountBucketDays = 365,
@@ -365,7 +365,7 @@ function Invoke-Canary {
 
             $message = $_.Exception.Message
 
-            # Wrong endpoint, bad JSON, auth/configuration errors, etc. should not be retried endlessly.
+            # Wrong endpoint, bad JSON, auth/configuration errors, and similar failures stop retries.
             $nonRetryable = (
                 $message -match '(?i)(returned HTML instead of JSON|Could not parse Canary response as JSON|401|403|404|unauthori|forbidden)'
             )
@@ -538,8 +538,7 @@ function Get-CanaryTagCountsResilient {
         if (([string]$result.Data.statusCode) -ne "Good") {
             $errorText = (@($result.Data.errors) -join "; ")
 
-            # This is important. Do not recursively turn a request/version/configuration
-            # problem into thousands of fake "bad tag" results.
+            # Keep request/version/configuration problems as one clear failure.
             if (-not (Test-TagSpecificError $errorText)) {
                 throw "Count request failed with a systemic API error. No tags will be marked bad. Canary response: $errorText"
             }
@@ -864,7 +863,7 @@ if ($countableContexts.Count -gt 0) {
     $sampleMode = "highest TVQ counts"
 }
 else {
-    # Count may be unavailable on a particular server/configuration. We can still benchmark
+    # Count may be unavailable on a particular server/configuration. Raw reads can still be benchmarked
     # raw reads by choosing tags with the longest visible history.
     $sampleTags = @(
         $validContexts |

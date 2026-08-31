@@ -4,47 +4,46 @@
 
 .DESCRIPTION
     PURPOSE
-    -------
+    =======
     This script creates a lossless bulk export of all accessible historical Canary tag data.
     It is designed for large historians, long-running unattended exports, older Canary 23.x
     servers, current Canary 25.x servers, and Windows PowerShell 5.1 as well as PowerShell 7+.
 
-    The exporter deliberately stores Canary's raw getTagData2 JSON response pages instead of
-    transforming hundreds of millions of TVQs during extraction. This keeps the historian-facing
-    portion of the workflow as fast and recoverable as possible. A separate converter can turn the
-    completed JSON/JSON.GZ pages into CSV, CSV.GZ, per-page ZIP files, or one ZIP archive later.
+    The exporter stores Canary's raw getTagData2 JSON response pages during extraction. This keeps
+    the historian-facing portion of the workflow focused on API reads. A separate converter can turn
+    the completed JSON/JSON.GZ pages into CSV, CSV.GZ, per-page ZIP files, or one ZIP archive later.
 
     HIGH-LEVEL WORKFLOW
-    -------------------
+    ===================
     1. Browse tags
-       - Calls browseTags and follows Canary continuation until all accessible tags are discovered.
-       - By default excludes only tags containing the literal text {Diagnostics}.
-       - Other names containing words such as System.Diagnostics are NOT excluded unless the
+       * Calls browseTags and follows Canary continuation until all accessible tags are discovered.
+       * By default excludes only tags containing the literal text {Diagnostics}.
+       * Names containing words such as System.Diagnostics remain included unless the
          -ExcludeRegex parameter is changed.
 
     2. Resolve historical context
-       - Calls getTagContext in batches to determine each tag's oldest/latest historical timestamp.
-       - If a context batch fails because of one or more tag-specific problems, the batch is split
+       * Calls getTagContext in batches to determine each tag's oldest/latest historical timestamp.
+       * If a context batch fails because of one or more tag-specific problems, the batch is split
          recursively until the individual problematic tag(s) are identified.
-       - Tags that cannot resolve context are not silently discarded. They become individual
-         fallback batches and are still given one direct raw-history export attempt.
+       * Tags that fail context resolution become individual fallback batches and receive one direct
+         raw-history export attempt.
 
     3. Count expected TVQs (optional)
-       - Uses Canary's Count aggregate only for progress and ETA estimation.
-       - Uses explicit Count buckets (365 days by default) rather than one historian-wide TimeSpan.
-         This is important for Canary 23.x, which cannot represent an absolute TimeSpan >1000 days.
-       - If Count is unavailable systemically, the raw export can still proceed.
+       * Uses Canary's Count aggregate only for progress and ETA estimation.
+       * Uses explicit Count buckets (365 days by default). Canary 23.x rejects some absolute
+         TimeSpan values over 1000 days.
+       * If Count is unavailable systemically, the raw export can still proceed.
 
     4. Export raw history
-       - Calls getTagData2 without aggregate parameters, which requests raw historical TVQs.
-       - Normal resolved tags are grouped into B batches (B00001, B00002, ...).
-       - Context-unresolved fallback tags are attempted one-at-a-time as U batches
+       * Calls getTagData2 without aggregate parameters, which requests raw historical TVQs.
+       * Normal resolved tags are grouped into B batches (B00001, B00002, ...).
+       * Context-unresolved fallback tags are attempted one-at-a-time as U batches
          (U00001, U00002, ... within the same global batch numbering sequence).
-       - Each Canary response is one page. If Canary returns continuation tokens, the next request
+       * Each Canary response is one page. If Canary returns continuation tokens, the next request
          uses those tokens and produces the next page.
 
     BATCH AND PAGE DIRECTORY MEANING
-    --------------------------------
+    ================================
     data\B00001\page-000001.json
         B = normal/resolved batch, usually containing -ExportBatchSize tags.
         00001 = global batch identifier.
@@ -55,12 +54,12 @@
 
     data\U00873\page-000001.json
         U = context-fallback batch containing exactly one tag whose getTagContext lookup failed.
-        The U number is the global batch identifier; it is not the count of unavailable tags.
+        The U number is the global batch identifier.
 
     A batch is complete when Canary no longer returns continuation tokens.
 
     OUTPUT AND CHECKPOINTING
-    ------------------------
+    ========================
     <OutputDirectory>\
       state.json                Durable resume checkpoint and per-batch state.
       pages.jsonl               Append-only audit record for successfully committed pages.
@@ -80,15 +79,13 @@
       3. The temporary file is renamed to its final page name.
       4. Only after the final data file exists is state.json checkpointed.
 
-    This ordering prevents state.json from claiming that a page is complete when its data file was
-    never safely committed. Re-running the same command with the same OutputDirectory resumes from
-    the last committed continuation instead of starting over.
+    This ordering keeps state.json aligned with committed data files. Re-running the same command
+    with the same OutputDirectory resumes from the last committed continuation.
 
     RAW JSON VS GZIP
-    ----------------
-    The exporter defaults to -OutputCompression None. Raw JSON is intentionally preferred during extraction
-    because historian access is the critical path and compression can be performed later without
-    touching Canary again.
+    ================
+    The exporter defaults to -OutputCompression None. Raw JSON keeps historian access on the critical
+    path, and compression can run later without touching Canary again.
 
       None     -> page-000001.json
       Fastest  -> page-000001.json.gz using fast gzip compression
@@ -98,54 +95,51 @@
     storage setting. Checkpoint repair recognizes both formats.
 
     RETRIES AND PERMANENT FAILURES
-    ------------------------------
+    ==============================
     Transient HTTP/network/API failures use exponential backoff with jitter. With the defaults,
     retry waits grow approximately 2s, 4s, 8s, 16s, 32s, capped by -RetryMaxDelaySeconds.
 
-    Known permanent failures are NOT retried repeatedly. Examples include:
-      - authentication/authorization/not-found HTTP responses;
-      - a tag that does not exist or is inaccessible;
-      - Canary 23.x >1000-day absolute TimeSpan errors;
-      - Canary error 0x800403F8 / "TagKey contains no TrendVectors".
+    Known permanent failures skip repeated retries. Examples include:
+      * authentication/authorization/not-found HTTP responses;
+      * an inaccessible or missing tag;
+      * Canary 23.x >1000-day absolute TimeSpan errors;
+      * Canary error 0x800403F8 / "TagKey contains no TrendVectors".
 
     "TagKey contains no TrendVectors" means Canary can identify the tag metadata but has no trend
-    vectors available to satisfy a historical read. Retrying the exact request will not create the
-    missing history, so the exporter classifies it as permanent immediately. For a U fallback batch,
-    that tag is marked Unavailable after the first failed API request instead of consuming the full
-    retry schedule.
+    vectors available to satisfy a historical read. The exporter classifies the condition as
+    permanent immediately. For a U fallback batch, that tag is marked Unavailable after the first
+    failed API request.
 
     AUTHENTICATION / CANARY VERSION COMPATIBILITY
-    ---------------------------------------------
+    =============================================
     The same script supports:
-      - anonymous Views endpoint, commonly http://server:55235 on Canary 23.x;
-      - -AccessToken for older Views configurations;
-      - -UserToken where configured;
-      - -ApiToken for newer Canary versions;
-      - HTTPS endpoint, commonly https://server:55236.
+      * anonymous Views endpoint, commonly http://server:55235 on Canary 23.x;
+      * -AccessToken for older Views configurations;
+      * -UserToken where configured;
+      * -ApiToken for newer Canary versions;
+      * HTTPS endpoint, commonly https://server:55236.
 
-    Specify at most one token parameter. Tokens are never written to logs, state, manifests, or
-    output files.
+    Specify at most one token parameter. Tokens stay out of logs, state, manifests, and output files.
 
     PERFORMANCE NOTES
-    -----------------
-    - Large raw history responses use a compiled .NET metadata parser when available. It extracts
+    =================
+    * Large raw history responses use a compiled .NET metadata parser when available. It extracts
       only response status, exact TVQ count, and continuation metadata without converting a 30-60 MB
       JSON response into hundreds of thousands of PowerShell objects.
-    - -MaxSizePerTag controls the maximum values requested per tag per API call. With the default
+    * -MaxSizePerTag controls the maximum values requested per tag per API call. With the default
       ExportBatchSize=20 and MaxSizePerTag=25000, a high-volume page is roughly 500,000 TVQs.
       A fresh export can often use MaxSizePerTag=50000 for roughly 1,000,000 TVQs/page, subject to
       server/network capacity.
-    - Enable hashes only when required. Hashing adds local I/O/CPU work and is not needed for basic
-      checkpoint safety.
+    * Enable hashes only when required. Hashing adds local I/O/CPU work.
 
     SAFETY / OPERATIONAL NOTES
-    --------------------------
-    - The script never deletes historian data and uses only Canary Read API operations.
-    - The script never modifies existing finalized page files during normal extraction.
-    - Ctrl+C, a PowerShell crash, network interruption, or host reboot can be recovered by rerunning
+    ==========================
+    * The script uses only Canary Read API operations.
+    * The script leaves existing finalized page files unchanged during normal extraction.
+    * Ctrl+C, a PowerShell crash, network interruption, or host reboot can be recovered by rerunning
       the same command against the same OutputDirectory.
-    - Do not manually edit state.json while an export is running.
-    - For a uniform storage format, start a new OutputDirectory. For fastest recovery/resume, reuse
+    * Leave state.json unchanged while an export is running.
+    * For a uniform storage format, start a new OutputDirectory. For fastest recovery/resume, reuse
       the existing one and allow mixed legacy JSON.GZ plus new JSON pages.
 
 .EXAMPLE
@@ -194,7 +188,7 @@ param(
     [int]$ContextBatchSize = 250,
     [int]$CountBatchSize = 100,
 
-    # Canary 23.x cannot represent one absolute TimeSpan over 1000 days.
+    # Canary 23.x rejects some absolute TimeSpan values over 1000 days.
     # Keep this <= 999 so Count works across old and new Canary versions.
     [ValidateRange(1, 999)]
     [int]$CountBucketDays = 365,
@@ -219,7 +213,7 @@ param(
     [double]$RetryMaxDelaySeconds = 45.0,
 
     # Used only when getTagContext rejects a browsed non-diagnostic tag.
-    # Such tags are attempted individually instead of being silently discarded.
+    # Such tags are attempted individually.
     [string]$FallbackStartTime = "1900-01-01T00:00:00Z",
 
     [switch]$InsecureSkipCertificateCheck,
@@ -1022,8 +1016,8 @@ function Invoke-CanaryRequest {
                     }
                 }
 
-                # If Canary reports an error, or the helper cannot recognize
-                # the response, parse normally so the full error is preserved.
+                # Parse normally when Canary reports an error or the helper
+                # misses the response shape. Preserve the full error.
             }
 
             $parseSw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1480,7 +1474,7 @@ function New-ExportState {
     @($script:UnavailableTags) | Export-Csv -LiteralPath $UnavailablePath -NoTypeInformation
     @($script:NoCountTags) | Export-Csv -LiteralPath $NoCountPath -NoTypeInformation
 
-    # Sort high-volume tags first when counts are known. This gives stable, full pages early
+    # Sort high-volume tags first when counts are known. This gives full pages early
     # and makes the live throughput estimate settle quickly.
     $resolvedForExport = @(
         $contexts | Sort-Object @{ Expression = {
@@ -1509,8 +1503,8 @@ function New-ExportState {
         })
     }
 
-    # Do not silently drop context-rejected non-diagnostic tags. Attempt each individually
-    # across a deliberately broad fallback interval. Permanent access/not-found failures are
+    # Attempt context-rejected non-diagnostic tags individually across a broad fallback interval.
+    # Permanent access/not-found failures are
     # logged and preserved in state without blocking the rest of the export.
     $unresolvedUnique = @($script:UnavailableTags | Select-Object -ExpandProperty Tag -Unique)
     foreach ($tag in $unresolvedUnique) {

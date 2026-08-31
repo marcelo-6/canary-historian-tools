@@ -5,35 +5,35 @@
 
 .DESCRIPTION
     PURPOSE
-    -------
-    This script is the post-processing companion to Export-CanaryHistorian.ps1 and is also
-    compatible with exports produced by earlier versions. The exporter intentionally stores Canary getTagData2 responses as
-    raw JSON or JSON.GZ pages because that is the fastest and safest way to extract large amounts of
-    historian data. This converter turns those lossless page files into conventional row-oriented CSV.
+    =======
+    This script is the post-processing companion to Export-CanaryHistorian.ps1 and is compatible
+    with exports produced by earlier versions. The exporter stores Canary getTagData2 responses as
+    raw JSON or JSON.GZ pages during extraction. This converter turns those lossless page files into
+    conventional row-oriented CSV.
 
     It can be run after the export is complete, or in -Watch mode while the exporter is still writing.
 
     SOURCE LAYOUT
-    -------------
+    =============
     The exporter stores finalized pages beneath:
 
       <ExportDirectory>\data\B00001\page-000001.json
       <ExportDirectory>\data\B00001\page-000002.json
       <ExportDirectory>\data\U00873\page-000001.json
 
-    Older/resumed exports may contain .json.gz instead of .json. Mixed JSON and JSON.GZ input is
-    supported automatically.
+    Older/resumed exports may contain .json.gz files. Mixed JSON and JSON.GZ input is supported
+    automatically.
 
     Folder meanings are inherited from the exporter:
       Bxxxxx = normal/resolved multi-tag export batch.
       Uxxxxx = single-tag fallback batch for a tag whose getTagContext lookup was unresolved.
       page-xxxxxx = one Canary getTagData2 response. Later pages are continuation responses.
 
-    The converter ignores exporter temporary files (*.tmp.*), so it never opens a page until the
-    exporter has atomically published that page under its final .json or .json.gz name.
+    The converter ignores exporter temporary files (*.tmp.*). It opens a page after the exporter has
+    atomically published that page under its final .json or .json.gz name.
 
     CSV SHAPE
-    ---------
+    =========
     Each Canary point is flattened to:
 
       Tag,Timestamp,Value,Quality
@@ -43,10 +43,10 @@
       Example.Process.Temperature,2024-03-08T13:37:13.1960000-05:00,27.339344,192
 
     Canary's numeric quality value is preserved exactly as returned. Timestamp ordering, duplicate
-    timestamps, values, and quality codes are not modified, sorted, interpreted, or deduplicated.
+    timestamps, values, and quality codes remain in source-page form.
 
     OUTPUT MODES
-    ------------
+    ============
     Select the container with -Compression:
 
       -Compression None
@@ -79,92 +79,89 @@
               data/U00873/page-000001.csv
               ...
 
-          IMPORTANT: a single ZIP cannot be safely checkpointed by appending entries directly while
-          a long conversion is running. A crash during ZIP central-directory finalization can corrupt
-          the whole archive. To preserve the same restart safety as the exporter, SingleArchive mode
-          therefore uses a staging tree:
+          IMPORTANT: SingleArchive mode uses a staging tree. Appending directly to one ZIP during a
+          long conversion risks archive corruption during central-directory finalization.
 
           csv-conversion\_single-zip-staging\data\B00001\page-000001.csv
 
-          Every source page is converted and checkpointed to staging atomically. Only after all
-          currently required source pages are safely staged does the script build a temporary ZIP and
-          atomically rename it to CanaryCsvData.zip. If archive creation fails, the staged CSV pages
-          remain intact and the archive can be rebuilt without re-reading/re-converting all JSON.
+          Every source page is converted and checkpointed to staging atomically. After all currently
+          required source pages are safely staged, the script builds a temporary ZIP and atomically
+          renames it to CanaryCsvData.zip. If archive creation fails, the staged CSV pages remain
+          intact and the archive can be rebuilt without rereading or reconverting all JSON.
 
-          The staging tree is intentionally retained after a successful archive. It is the recovery
-          checkpoint for rebuilding the single ZIP. Once you have independently verified/copied the
-          final ZIP and no longer need resumability, the _single-zip-staging folder may be deleted.
+          The staging tree is retained after a successful archive. It is the recovery checkpoint for
+          rebuilding the single ZIP. After independent verification or copying, the
+          _single-zip-staging folder may be deleted.
 
     WATCH MODE
-    ----------
+    ==========
     -Watch repeatedly scans the exporter's data folder and converts newly finalized pages.
 
     With None, Gzip, or Zip/PerFile:
-      - output files appear continuously as new exporter pages appear;
-      - Ctrl+C is safe;
-      - rerunning the same command resumes from conversion-manifest.jsonl.
+      * output files appear continuously as new exporter pages appear;
+      * Ctrl+C is safe;
+      * rerunning the same command resumes from conversion-manifest.jsonl.
 
     With Zip/SingleArchive:
-      - new pages are continuously converted into the staging tree;
-      - the script reads the exporter's state.json to determine whether the exporter is finished;
-      - when all exporter batches are Complete or Unavailable, every discovered source page is
+      * new pages are continuously converted into the staging tree;
+      * the script reads the exporter's state.json to determine whether the exporter is finished;
+      * when all exporter batches are Complete or Unavailable, every discovered source page is
         checkpointed, and no conversion failures remain, the final single ZIP is built atomically;
-      - after successful finalization, Watch mode exits automatically.
-      - if exporter state cannot be found/read, the converter keeps watching rather than guessing
-        that the export is complete.
+      * after successful finalization, Watch mode exits automatically.
+      * if exporter state is unavailable, the converter keeps watching.
 
-    When NOT using -Watch, SingleArchive mode performs one scan. If all discovered source pages are
+    Without -Watch, SingleArchive mode performs one scan. If all discovered source pages are
     successfully staged, it builds a ZIP representing that snapshot. If the exporter is still running,
-    that ZIP is only a snapshot of what existed at scan time; use -Watch when you want automatic final
+    that ZIP is a snapshot of what existed at scan time; use -Watch when you want automatic final
     packaging after the exporter itself completes.
 
     RESTART / CHECKPOINT MODEL
-    --------------------------
+    ==========================
     conversion-manifest.jsonl is append-only. Each successful source page records:
-      - source relative path;
-      - source file length and last-write timestamp;
-      - output/staging path;
-      - output length;
-      - row and tag counts;
-      - parser and compression mode.
+      * source relative path;
+      * source file length and last-write timestamp;
+      * output/staging path;
+      * output length;
+      * row and tag counts;
+      * parser and compression mode.
 
     On restart, a page is skipped only when:
-      - a matching manifest entry exists;
-      - the expected output/staging file exists and is non-empty;
-      - source length matches;
-      - source last-write timestamp matches.
+      * a matching manifest entry exists;
+      * the expected output/staging file exists and is non-empty;
+      * source length matches;
+      * source last-write timestamp matches.
 
     If an output file is deleted or a source page changes, that page is converted again.
 
     OUTPUT WRITES ARE ATOMIC
-    ------------------------
+    ========================
     Per-page CSV/GZIP/ZIP/staging outputs are first written to a temporary file in the destination
     directory. The temporary file is moved to the final name only after conversion and stream/ZIP
-    finalization succeeds. Failed temporary files are removed and the page is not checkpointed.
+    finalization succeeds. Failed temporary files are removed, and the page remains uncheckpointed.
 
     The final SingleArchive ZIP is built using the same principle:
       CanaryCsvData.zip.tmp.<pid>.<guid> -> CanaryCsvData.zip
 
     PARSER / PERFORMANCE
-    --------------------
+    ====================
     The preferred parser is a streaming Json.NET converter. It reads one token/point at a time and
     writes CSV directly to the output stream, avoiding construction of hundreds of thousands of
     PowerShell objects for a large page.
 
     If Json.NET is unavailable in the current PowerShell host, the script falls back to
-    ConvertFrom-Json and reports that choice in the console. The fallback is valid but generally uses
-    more memory and CPU.
+    ConvertFrom-Json and reports that choice in the console. The fallback generally uses more memory
+    and CPU.
 
     -CompressionLevel controls GZIP and ZIP compression and accepts Fastest or Optimal.
     Fastest is useful when conversion throughput matters more than squeezing the final archive size.
 
     SINGLE-INSTANCE SAFETY
-    ----------------------
+    ======================
     A converter.lock file is held open exclusively for the selected OutputDirectory. A second
-    converter process cannot use the same output tree concurrently. This prevents competing manifest
+    converter process is blocked from the same output tree. This prevents competing manifest
     appends and duplicate/overlapping output writes.
 
-    The converter NEVER deletes or modifies the original Canary exporter data.
+    The converter leaves the original Canary exporter data unchanged.
 
 .EXAMPLE
     # Default: one GZIP-compressed CSV per source page
@@ -245,14 +242,14 @@ param(
     [int]$RetryBaseSeconds = 2,
 
     # Useful for a small validation run. 0 means unlimited.
-    # A limited run will not finalize SingleArchive unless every discovered source page is already staged.
+    # A limited run finalizes SingleArchive after every discovered source page is staged.
     [ValidateRange(0, 100000000)]
     [int]$MaxPages = 0,
 
     # Re-convert pages even when a matching completed manifest entry exists.
     [switch]$Force,
 
-    # Force the very slow PowerShell object-model parser instead of either compiled streaming parser.
+    # Force the PowerShell object-model parser and skip compiled streaming parsers.
     [switch]$UsePowerShellParser,
 
     # Number of successfully converted pages between explicit garbage collections.
@@ -428,7 +425,7 @@ catch {
 #   2. Dependency-free compiled .NET Framework parser using JsonReaderWriterFactory.
 #   3. ConvertFrom-Json only as a last-resort fallback.
 #
-# The second option is important on Windows PowerShell 5.1 systems where Json.NET is not installed.
+# The second option supports Windows PowerShell 5.1 systems without Json.NET.
 # It stays inside compiled C# for the hot loop, reads the JSON as a forward-only stream, and writes
 # CSV rows directly. It therefore avoids creating ~500,000+ PSCustomObject instances per page.
 # ============================================================
@@ -443,9 +440,9 @@ function Initialize-StreamingConverter {
         return
     }
 
-    # --------------------------------------------------------
+    # ========================================================
     # Option 1: Json.NET, if the host already has it loaded.
-    # --------------------------------------------------------
+    # ========================================================
     try {
         $newtonsoftAssembly = @(
             [AppDomain]::CurrentDomain.GetAssemblies() |
@@ -680,11 +677,11 @@ public static class CanaryCsvStreamingConverter
         )
     }
 
-    # --------------------------------------------------------
+    # ========================================================
     # Option 2: dependency-free compiled .NET streaming parser.
     # JsonReaderWriterFactory is part of .NET Framework and exposes
     # a forward-only JSON reader through XmlDictionaryReader.
-    # --------------------------------------------------------
+    # ========================================================
     try {
         try { Add-Type -AssemblyName System.Runtime.Serialization -ErrorAction Stop } catch {}
 

@@ -5,9 +5,9 @@
 The exporter creates two batch types under `data/`:
 
 - `Bxxxxx`: normal batches whose tags successfully resolved historical context.
-- `Uxxxxx`: one-tag fallback batches for tags whose `getTagContext` request could not be resolved normally.
+- `Uxxxxx`: one-tag fallback batches for tags whose `getTagContext` request failed normal resolution.
 
-The numeric suffix is one global batch identifier. `U00873` means global batch 873, not the 873rd unavailable tag.
+The numeric suffix is one global batch identifier. `U00873` means global batch 873.
 
 ## Pages
 
@@ -35,7 +35,7 @@ Durable resume state. It records the export configuration and per-batch progress
 
 ### `pages.jsonl`
 
-Append-only audit metadata for committed pages. This is useful for reviewing counts, sizes, and timing without opening every JSON page.
+Append-only audit metadata for committed pages. Use it to review counts, sizes, and timing without opening every JSON page.
 
 ### `tag-inventory.csv`
 
@@ -43,7 +43,7 @@ The resolved tag inventory with context/count information used by the exporter.
 
 ### `unavailable-tags.csv`
 
-Tags whose context lookup could not be resolved normally. These may still be attempted as `U` fallback batches.
+Tags whose context lookup failed normal resolution. These may still be attempted as `U` fallback batches.
 
 ## Atomic writes
 
@@ -53,8 +53,8 @@ This means the converter can safely ignore `*.tmp.*` and process only finalized 
 
 ## Permanent failures
 
-Some Canary errors are not transient. For example, `TagKey contains no TrendVectors` (`0x800403F8`) indicates that the tag cannot provide historical trend vectors. The exporter classifies known permanent conditions and stops retrying them through the full backoff schedule.
+Some Canary errors are permanent. For example, `TagKey contains no TrendVectors` (`0x800403F8`) indicates that the tag lacks historical trend vectors. The exporter classifies known permanent conditions and skips the full backoff schedule.
 
 ## Count is advisory
 
-The Count phase exists for progress and ETA estimates. It is not required for correctness of raw extraction. If Count cannot be performed systemically, the exporter can continue with raw history requests.
+The Count phase exists for progress and ETA estimates. Raw extraction correctness comes from `getTagData2` pages and checkpoints. If Count fails systemically, the exporter can continue with raw history requests.

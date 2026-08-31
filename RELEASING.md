@@ -51,5 +51,3 @@ The workflow:
 5. Packages the public scripts and top-level documentation into `canary-historian-tools-<tag>.zip`.
 6. Generates a SHA-256 checksum.
 7. Creates the GitHub Release with both assets.
-
-The release ZIP intentionally contains stable filenames such as `Export-CanaryHistorian.ps1`; users should not need to rename scripts between releases.

@@ -1,6 +1,6 @@
 # Contributing
 
-Contributions are welcome. The runtime tools intentionally remain plain PowerShell scripts with no mandatory third-party runtime dependency.
+Contributions are welcome. The runtime tools remain plain PowerShell scripts with no mandatory third-party runtime dependency.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ Recommended contributor tools:
 - lychee
 - just
 
-Pester 5 is intentionally used in CI because it supports both Windows PowerShell 5.1 and current PowerShell 7 while keeping the test syntax stable.
+Pester 5 runs in CI because it supports both Windows PowerShell 5.1 and current PowerShell 7.
 
 ## Setup
 
@@ -28,7 +28,7 @@ Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser
 Install-Module Pester -RequiredVersion 5.9.0 -Scope CurrentUser
 ```
 
-Optional Rust tooling can be installed with your preferred method (`cargo install`, `cargo-binstall`, package manager, or pre-built binaries).
+Optional Rust tooling can be installed with your preferred method (`cargo install`, `cargo-binstall`, package manager, or packaged binaries).
 
 ## Checks
 
@@ -75,4 +75,4 @@ A useful pull request should include:
 3. A description of resume/checkpoint implications for exporter changes.
 4. Tests or a reproducible sample payload for parser/converter changes.
 
-Do not commit API tokens, historian exports, customer tag names, production logs, or other private system data.
+Keep API tokens, historian exports, customer tag names, production logs, and other private system data out of commits.

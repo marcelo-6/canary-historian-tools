@@ -15,17 +15,17 @@
 </div>
 
 > [!IMPORTANT]
-> This is an unofficial community project. It is not affiliated with, endorsed by, or supported by Canary Labs. Validate exports before using them as a sole archival or migration source.
+> This is an unofficial community project with no Canary Labs affiliation, endorsement, or support. Validate exports before using them as a sole archival or migration source.
 
-`canary-historian-tools` is a small toolkit for moving large amounts of historical data out of Canary without making a single long-running API call or forcing expensive CSV conversion into the historian-facing path.
+`canary-historian-tools` is a small toolkit for moving large amounts of historical data out of Canary.
 
-The workflow is intentionally split into three tools:
+The workflow is split into three tools.
 
-| Tool | Purpose |
-| --- | --- |
-| [`Benchmark-CanaryHistorian.ps1`](scripts/Benchmark-CanaryHistorian.ps1) | Discover tags, inspect historical range, estimate TVQ volume, and measure raw API throughput before a bulk export. |
-| [`Export-CanaryHistorian.ps1`](scripts/Export-CanaryHistorian.ps1) | Resumable bulk export of raw `getTagData2` pages with retries, checkpoints, continuation handling, logs, and permanent-failure classification. |
-| [`Convert-CanaryJsonToCsv.ps1`](scripts/Convert-CanaryJsonToCsv.ps1) | Streaming post-processing from raw JSON/JSON.GZ pages to CSV, CSV.GZ, per-page ZIPs, or one ZIP for the entire converted data tree. |
+[`Benchmark-CanaryHistorian.ps1`](scripts/Benchmark-CanaryHistorian.ps1) discovers tags, inspects historical range, estimates TVQ volume, and measures raw API throughput before a bulk export.
+
+[`Export-CanaryHistorian.ps1`](scripts/Export-CanaryHistorian.ps1) performs resumable bulk export of raw `getTagData2` pages with retries, checkpoints, continuation handling, logs, and permanent-failure classification.
+
+[`Convert-CanaryJsonToCsv.ps1`](scripts/Convert-CanaryJsonToCsv.ps1) streams raw JSON/JSON.GZ pages to CSV, CSV.GZ, per-page ZIPs, or one ZIP for the entire converted data tree.
 
 The scripts are designed for **Windows PowerShell 5.1 and PowerShell 7+** and have been exercised against Canary 23.x and 25.x Read API behavior. The exporter supports anonymous access as well as `apiToken`, `accessToken`, and `userToken` authentication.
 
@@ -40,12 +40,16 @@ Canary Views API
  getTagData2
       |
       v
- raw JSON page ------> checkpoint
+ raw JSON page
       |
-      +-------------> later CSV / CSV.GZ / ZIP conversion
+      v
+ checkpoint
+      |
+      v
+ later CSV / CSV.GZ / ZIP conversion
 ```
 
-This avoids spending historian-export time constructing hundreds of millions of PowerShell objects or compressing every page before the next API request. The converter can then run separately, or in watch mode alongside the exporter.
+This keeps historian-export time focused on API reads. CSV object construction and compression can run later through the converter, or concurrently in watch mode.
 
 ## Quick start
 
@@ -86,7 +90,7 @@ A larger page size can reduce request/checkpoint overhead if the server and clie
     -MaxSizePerTag 50000
 ```
 
-The default exclusion removes literal `{Diagnostics}` tags only. Other paths containing words such as `System.Diagnostics` remain included unless you provide a different `-ExcludeRegex`.
+The default exclusion removes literal `{Diagnostics}` tags only. Paths containing words such as `System.Diagnostics` remain included unless you provide a different `-ExcludeRegex`.
 
 ### 3. Convert to CSV
 
@@ -119,7 +123,7 @@ One ZIP containing the entire converted data tree:
     -CompressionLevel Fastest
 ```
 
-The converter uses streaming parsing for large pages. Json.NET is used when available; otherwise it can use its compiled dependency-free .NET streaming parser. It does not need to build the complete JSON document as PowerShell objects.
+The converter uses streaming parsing for large pages. Json.NET runs when available. The compiled dependency-free .NET streaming parser handles hosts without Json.NET. The converter avoids building the complete JSON document as PowerShell objects.
 
 ## Export layout
 
@@ -127,26 +131,24 @@ A typical export looks like this:
 
 ```text
 CanaryExport/
-|-- state.json
-|-- pages.jsonl
-|-- tag-inventory.csv
-|-- excluded-tags.csv
-|-- unavailable-tags.csv
-|-- tags-without-count.csv
-|-- summary.json
-|-- logs/
-`-- data/
-    |-- B00001/
-    |   |-- page-000001.json
-    |   |-- page-000002.json
-    |   `-- ...
-    |-- B00002/
-    |   `-- ...
-    `-- U00873/
-        `-- page-000001.json
+  state.json
+  pages.jsonl
+  tag-inventory.csv
+  excluded-tags.csv
+  unavailable-tags.csv
+  tags-without-count.csv
+  summary.json
+  logs/
+  data/
+    B00001/
+      page-000001.json
+      page-000002.json
+    B00002/
+    U00873/
+      page-000001.json
 ```
 
-`Bxxxxx` directories are normal resolved multi-tag batches. `Uxxxxx` directories are single-tag fallback batches for tags whose historical context could not be resolved normally. A `page-xxxxxx` file is one `getTagData2` response; later pages are fetched with Canary continuation tokens.
+`Bxxxxx` directories are normal resolved multi-tag batches. `Uxxxxx` directories are single-tag fallback batches for tags whose historical context failed normal resolution. A `page-xxxxxx` file is one `getTagData2` response; later pages use Canary continuation tokens.
 
 See [Export format and recovery](docs/export-format.md) for the complete model.
 
@@ -154,7 +156,7 @@ See [Export format and recovery](docs/export-format.md) for the complete model.
 
 Run the same command against the same output directory. `state.json` stores batch status, page number, and continuation state. Finalized page files are checked before resume, and incomplete temporary files are ignored.
 
-Permanent tag failures such as `TagKey contains no TrendVectors` / `0x800403F8` are classified as unavailable instead of being retried through the full exponential-backoff schedule.
+Permanent tag failures such as `TagKey contains no TrendVectors` / `0x800403F8` are classified as unavailable. The exporter skips the full exponential-backoff schedule for those conditions.
 
 ## Canary version notes
 
@@ -174,7 +176,7 @@ Tag,Timestamp,Value,Quality
 Example.Process.Temperature,2024-03-08T13:37:13.1960000-05:00,27.339344,192
 ```
 
-CSV escaping follows normal CSV rules. String values containing commas, quotes, or newlines are quoted and embedded quotes are doubled. Quality values are preserved numerically as returned by Canary; the converter does not reinterpret them.
+CSV escaping follows normal CSV rules. String values containing commas, quotes, or newlines are quoted and embedded quotes are doubled. Quality values are preserved numerically as returned by Canary; the converter leaves their meaning to Canary.
 
 ## Safety and operational behavior
 
@@ -182,10 +184,10 @@ CSV escaping follows normal CSV rules. String values containing commas, quotes, 
 - Checkpoints are committed only after page writes succeed.
 - Temporary files are ignored during resume/conversion.
 - Transient failures use exponential backoff with jitter.
-- Known permanent tag errors do not burn the complete retry schedule.
-- API tokens are not written to state or logs.
-- The converter does not modify or delete the raw historian export.
-- Single-archive ZIP conversion uses a staging tree so a failed ZIP finalization cannot destroy conversion progress.
+- Known permanent tag errors skip the complete retry schedule.
+- API tokens stay out of state and logs.
+- The converter leaves the raw historian export unchanged.
+- Single-archive ZIP conversion uses a staging tree so failed ZIP finalization preserves conversion progress.
 
 ## Development
 
