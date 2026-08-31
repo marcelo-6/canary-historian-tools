@@ -54,5 +54,8 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             "dist/canary-historian-tools-${GITHUB_REF_NAME}.zip" \
             "dist/canary-historian-tools-${GITHUB_REF_NAME}.zip.sha256" \
+            "scripts/Benchmark-CanaryHistorian.ps1" \
+            "scripts/Convert-CanaryJsonToCsv.ps1" \
+            "scripts/Export-CanaryHistorian.ps1" \
             --title "${GITHUB_REF_NAME}" \
             --notes-file release-notes.md
