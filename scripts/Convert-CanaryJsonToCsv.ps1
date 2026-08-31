@@ -216,7 +216,7 @@ param(
     # None: plain .csv per page.
     # Gzip: .csv.gz per page.
     # Zip: either one .csv.zip per page or one final archive depending on -ZipLayout.
-    [ValidateSet("Gzip", "Zip", "None")]
+    [ValidateSet("None", "Gzip", "Zip")]
     [string]$Compression = "Gzip",
 
     # Used only when -Compression Zip.

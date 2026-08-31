@@ -1,60 +1,68 @@
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$scripts = @(
-    Join-Path $repoRoot 'scripts/Benchmark-CanaryHistorian.ps1'
-    Join-Path $repoRoot 'scripts/Export-CanaryHistorian.ps1'
-    Join-Path $repoRoot 'scripts/Convert-CanaryJsonToCsv.ps1'
-)
-
 Describe 'Public scripts' {
+    BeforeAll {
+        $script:repoRoot = Split-Path -Parent $PSScriptRoot
+        $script:scripts = @(
+            Join-Path $script:repoRoot 'scripts/Benchmark-CanaryHistorian.ps1'
+            Join-Path $script:repoRoot 'scripts/Export-CanaryHistorian.ps1'
+            Join-Path $script:repoRoot 'scripts/Convert-CanaryJsonToCsv.ps1'
+        )
+    }
+
     It 'contains all three public entry points' {
-        foreach ($script in $scripts) {
-            Test-Path $script | Should -BeTrue
+        foreach ($scriptPath in $script:scripts) {
+            Test-Path $scriptPath | Should -BeTrue
         }
     }
 
     It 'parses without PowerShell syntax errors' {
-        foreach ($script in $scripts) {
+        foreach ($scriptPath in $script:scripts) {
             $tokens = $null
             $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+            [void][System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
             @($errors).Count | Should -Be 0
         }
     }
 
     It 'has comment-based help' {
-        foreach ($script in $scripts) {
-            $content = Get-Content -Path $script -Raw
+        foreach ($scriptPath in $script:scripts) {
+            $content = Get-Content -Path $scriptPath -Raw
             $content | Should -Match '(?s)<#.*?\.SYNOPSIS.*?\.DESCRIPTION'
         }
     }
 }
 
 Describe 'Exporter safety behavior' {
-    $content = Get-Content -Path (Join-Path $repoRoot 'scripts/Export-CanaryHistorian.ps1') -Raw
+    BeforeAll {
+        $script:repoRoot = Split-Path -Parent $PSScriptRoot
+        $script:exporterContent = Get-Content -Path (Join-Path $script:repoRoot 'scripts/Export-CanaryHistorian.ps1') -Raw
+    }
 
     It 'recognizes no-TrendVectors as a permanent failure' {
-        $content | Should -Match 'TagKey contains no TrendVectors'
-        $content | Should -Match '0x800403F8'
+        $script:exporterContent | Should -Match 'TagKey contains no TrendVectors'
+        $script:exporterContent | Should -Match '0x800403F8'
     }
 
     It 'uses bounded Count buckets for older Canary servers' {
-        $content | Should -Match 'CountBucketDays'
-        $content | Should -Match 'ValidateRange\(1, 999\)'
+        $script:exporterContent | Should -Match 'CountBucketDays'
+        $script:exporterContent | Should -Match 'ValidateRange\(1, 999\)'
     }
 }
 
 Describe 'Converter output modes' {
-    $content = Get-Content -Path (Join-Path $repoRoot 'scripts/Convert-CanaryJsonToCsv.ps1') -Raw
+    BeforeAll {
+        $script:repoRoot = Split-Path -Parent $PSScriptRoot
+        $script:converterContent = Get-Content -Path (Join-Path $script:repoRoot 'scripts/Convert-CanaryJsonToCsv.ps1') -Raw
+    }
 
     It 'supports Gzip and Zip output' {
-        $content | Should -Match 'ValidateSet\("None", "Gzip", "Zip"\)'
+        $script:converterContent | Should -Match 'ValidateSet\("None", "Gzip", "Zip"\)'
     }
 
     It 'supports per-file and single-archive Zip layouts' {
-        $content | Should -Match 'ValidateSet\("PerFile", "SingleArchive"\)'
+        $script:converterContent | Should -Match 'ValidateSet\("PerFile", "SingleArchive"\)'
     }
 
     It 'contains a compiled streaming fallback' {
-        $content | Should -Match 'Compiled built-in \.NET streaming parser enabled'
+        $script:converterContent | Should -Match 'Compiled built-in \.NET streaming parser enabled'
     }
 }
