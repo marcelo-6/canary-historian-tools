@@ -249,7 +249,7 @@ function Test-TransientErrorText {
         return $false
     }
 
-    return $Text -match '(?i)(timeout|timed out|temporar|busy|unavailable|connection|reset|throttl|too many requests|service unavailable|bad gateway|gateway timeout|\b429\b|\b502\b|\b503\b|\b504\b)'
+    return $Text -match '(?i)(timeout|timed out|temporary|busy|unavailable|connection|reset|throttl|too many requests|service unavailable|bad gateway|gateway timeout|\b429\b|\b502\b|\b503\b|\b504\b)'
 }
 
 function Test-TagSpecificError {
