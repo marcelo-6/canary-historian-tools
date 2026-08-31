@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### <!-- 3 -->Documentation
+- Align documentation style  ([bd34f4c](https://github.com/marcelo-6/canary-historian-tools/commit/bd34f4cb5ed27be933a528f677251def596091de))
+
+
 ### <!-- 7 -->Miscellaneous Tasks
 - Update git-cliff changelog format  ([3c4ee34](https://github.com/marcelo-6/canary-historian-tools/commit/3c4ee342c0e00d32ff8355d8cf4a9a580c639de7))
 
@@ -34,3 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix lychee config for v0.24  by @marcelo-6 ([59a4b01](https://github.com/marcelo-6/canary-historian-tools/commit/59a4b010d1be8252d38a317bd6a6dbd84c1c9e86))
 
 - Only fail PSScriptAnalyzer on errors  by @marcelo-6 ([24c790d](https://github.com/marcelo-6/canary-historian-tools/commit/24c790d6c61e40dff91e109ccc2f0e9d79e21748))
+
+
+### New Contributors
+* @marcelo-6 made their first contribution
+
