@@ -1,0 +1,45 @@
+name: Bug report
+description: Report reproducible tool behavior
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API tokens, private historian exports, customer names, or sensitive tag paths.
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      placeholder: Export-CanaryHistorian.ps1
+    validations:
+      required: true
+  - type: input
+    id: canary
+    attributes:
+      label: Canary version
+      placeholder: 23.2.1
+  - type: input
+    id: powershell
+    attributes:
+      label: PowerShell version
+      placeholder: Windows PowerShell 5.1 / PowerShell 7.x
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized-log
+    attributes:
+      label: Sanitized log excerpt
+      description: Remove tokens and sensitive system/tag names before pasting.

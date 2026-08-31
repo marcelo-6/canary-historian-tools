@@ -1,0 +1,17 @@
+# Export/test output
+CanaryExport/
+canary-benchmark-*/
+*.log
+*.tmp.*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Tool output
+lychee/
+coverage.xml
+TestResults/
+dist/

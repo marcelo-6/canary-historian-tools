@@ -1,0 +1,8 @@
+[files]
+extend-exclude = ["CHANGELOG.md"]
+
+[default.extend-words]
+Canary = "Canary"
+TVQ = "TVQ"
+TVQs = "TVQs"
+Axiom = "Axiom"

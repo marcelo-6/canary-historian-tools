@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    name: Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install test modules
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          Install-Module Pester -RequiredVersion 5.9.0 -Scope CurrentUser -Force
+      - name: Syntax
+        shell: powershell
+        run: ./tools/Test-Syntax.ps1
+      - name: Lint
+        shell: powershell
+        run: ./tools/Test-Lint.ps1
+      - name: Tests
+        shell: powershell
+        run: Invoke-Pester -Path ./tests -Output Detailed
+
+  powershell-7:
+    name: PowerShell 7
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install test modules
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          Install-Module Pester -RequiredVersion 5.9.0 -Scope CurrentUser -Force
+      - name: Syntax
+        shell: pwsh
+        run: ./tools/Test-Syntax.ps1
+      - name: Lint
+        shell: pwsh
+        run: ./tools/Test-Lint.ps1
+      - name: Tests
+        shell: pwsh
+        run: Invoke-Pester -Path ./tests -Output Detailed
+
+  hygiene:
+    name: Repo hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Typos
+        uses: crate-ci/typos@v1.49.0
+      - name: Links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --config ./lychee.toml "./**/*.md"
+          fail: true

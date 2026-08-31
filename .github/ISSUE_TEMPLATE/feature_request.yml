@@ -1,0 +1,21 @@
+name: Feature request
+description: Propose an improvement
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: input
+    id: canary
+    attributes:
+      label: Relevant Canary version(s)

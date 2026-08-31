@@ -1,0 +1,5 @@
+cache = true
+max_cache_age = "1d"
+exclude_loopback = true
+exclude_mail = true
+accept = [200, 206, 429]

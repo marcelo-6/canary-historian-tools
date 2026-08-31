@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install PowerShell test modules
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          Install-Module Pester -RequiredVersion 5.9.0 -Scope CurrentUser -Force
+
+      - name: Validate release tree
+        shell: pwsh
+        run: ./tools/Test-Repository.ps1
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@git-cliff
+
+      - name: Generate release notes
+        shell: bash
+        run: git cliff --latest --strip header --output release-notes.md
+
+      - name: Package release
+        shell: pwsh
+        run: ./tools/Package-Release.ps1 -Version "${{ github.ref_name }}"
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/canary-historian-tools-${GITHUB_REF_NAME}.zip" \
+            "dist/canary-historian-tools-${GITHUB_REF_NAME}.zip.sha256" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
