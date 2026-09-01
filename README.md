@@ -2,7 +2,7 @@
 
 # Canary Historian Tools
 
-<h4>PowerShell tools for benchmarking, exporting, resuming, and converting large <a href="https://www.canarylabs.com/">Canary Historian</a> datasets through the Views Read API.</h4>
+<h4>PowerShell tools for exporting and converting large <a href="https://www.canarylabs.com/">Canary Historian</a> datasets through the Views Read API.</h4>
 
 <a href="https://github.com/marcelo-6/canary-historian-tools/releases"><img src="https://img.shields.io/github/v/release/marcelo-6/canary-historian-tools?logo=github" alt="GitHub Release"></a>
 <a href="https://github.com/marcelo-6/canary-historian-tools/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/marcelo-6/canary-historian-tools/ci.yml?branch=main&logo=GitHub%20Actions&logoColor=white&label=CI" alt="Continuous Integration"></a>
@@ -28,6 +28,48 @@ The workflow is split into three tools.
 [`Convert-CanaryJsonToCsv.ps1`](scripts/Convert-CanaryJsonToCsv.ps1) streams raw JSON/JSON.GZ pages to CSV, CSV.GZ, per-page ZIPs, or one ZIP for the entire converted data tree.
 
 The scripts are designed for **Windows PowerShell 5.1 and PowerShell 7+** and have been exercised against Canary 23.x and 25.x Read API behavior. The exporter supports anonymous access as well as `apiToken`, `accessToken`, and `userToken` authentication.
+
+## How to think about the workflow
+
+Canary stores historian values as TVQs: timestamp, value, and quality. A bulk export can touch millions or billions of TVQs, so the toolkit treats the job as a checkpointed extraction first and a formatting job second.
+
+Start with the benchmark when you do not know the historian size. It lists accessible tags, reads their history ranges, estimates TVQ volume, and runs a small raw API throughput check.
+
+Use the exporter to capture raw Canary `getTagData2` pages. The exporter writes one finalized page at a time, saves state after each page, and can resume after interruption. It also writes `export-plan.csv` before raw extraction so every included tag has a planned resolved batch or a one-tag fallback batch.
+
+Use the converter after raw export completes. Conversion is separate because CSV formatting and compression spend CPU and disk time. Keeping that work outside the live historian read path makes the actual extraction easier to resume and validate.
+
+## Export concepts
+
+A tag is one named historian series. For example, a temperature transmitter or process value.
+
+A TVQ is one historian value: timestamp, value, and quality.
+
+A batch is a group of tags exported together over a shared time range. Normal `Bxxxxx` batches contain tags whose historical context resolved cleanly. If `-ExportBatchSize 20` is used, most normal batches contain up to 20 tags.
+
+A one-tag fallback batch is a `Uxxxxx` batch created when a tag is browsed and included, but normal context lookup cannot prove its oldest/latest range. The exporter still attempts that tag individually over the fallback time range so it is recorded as exported or unavailable instead of quietly disappearing.
+
+A page is one successful `getTagData2` API response written to disk. A batch can have one page or many pages. If Canary returns a continuation token, the next page for that same batch must use that token.
+
+Parallel export runs multiple batches at once. It does not run multiple pages from the same batch at once because continuation tokens make pages order-dependent.
+
+## Choosing export settings
+
+| Parameter | Recommended start | What it does | When to change it |
+| --- | --- | --- | --- |
+| `-Server` | Required | Canary Views endpoint. The script adds `/api/v2` if needed. | Use `http://server:55235` for anonymous Views or `https://server:55236` for secured Views. |
+| `-ApiToken` | Use when required | Sends a Canary API token with each request. | Use `-AccessToken` or `-UserToken` only when that is how the site authenticates Read API calls. |
+| `-OutputDirectory` | Required for real exports | Stores state, logs, raw pages, inventory files, and summaries. | Reuse the same directory to resume. Use a new directory for a clean export. |
+| `-Path` | Empty | Limits browsing to a Canary tag path. Empty means all accessible tags. | Use it for a plant, area, or subsystem export. |
+| `-ExcludeRegex` | `\{Diagnostics\}` | Removes matching tags before export planning. The default excludes literal Canary diagnostics tags. | Change it only when you know which tags should stay out of the export. |
+| `-Parallelism` | `4` | Runs that many independent batch-page requests at once. | Use `2` to `4` first. Use `1` for troubleshooting or gentle server load. |
+| `-ExportBatchSize` | `20` | Sets how many resolved tags go into a normal batch. | Lower it when dense tags create many continuation pages. Raise it only when the server handles larger combined pages well. |
+| `-MaxSizePerTag` | `25000` | Requests up to this many values per tag per API call. | Raise it to reduce paging when the server allows it. Lower it if responses become too large. |
+| `-SkipCount` | Use for production retries | Skips aggregate Count estimates. Raw export still runs. | Use it when Count is slow, unavailable, license-restricted, or already proven unnecessary. |
+| `-OutputCompression` | `None` | Controls raw page storage during export. `None` writes plain JSON. | Use compression only when disk space matters during export. Convert/compress later when possible. |
+| `-MaxAttempts` | `6` | Controls retry count for transient request failures. | Raise it for unstable networks. Lower it when testing failure behavior. |
+| `-RetryFailedOnly` | Off | Processes only batches currently marked failed in `state.json`. | Use it after a mostly complete run when you want to focus on failures. |
+| `-InsecureSkipCertificateCheck` | Off | Skips TLS certificate validation in PowerShell 7+. | Use only for known self-signed internal endpoints. |
 
 ## Why raw JSON first?
 
@@ -168,7 +210,7 @@ See [Export format and recovery](docs/export-format.md) for the complete model.
 
 Run the same command against the same output directory. `state.json` stores batch status, page number, and continuation state. Finalized page files are checked before resume, and incomplete temporary files are ignored.
 
-`-Parallelism` and `-MaxSizePerTag` are stored in the final summary. Changing `-Parallelism` on resume is safe because it only changes how many independent batch pages run at once. Changing `-ExportBatchSize` or `-MaxSizePerTag` resets unfinished batches and keeps completed batches.
+`-Parallelism` and `-MaxSizePerTag` are stored in the final summary. Changing `-Parallelism` on resume does not invalidate existing pages; it only changes how many independent batch pages run at once. Changing `-ExportBatchSize` or `-MaxSizePerTag` resets unfinished batches and keeps completed batches.
 
 Permanent raw tag failures such as `TagKey contains no TrendVectors` / `0x800403F8` are classified as unavailable after a raw history request returns that condition. Aggregate Count failures only disable Count-based estimates.
 
