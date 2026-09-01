@@ -42,10 +42,6 @@ jobs:
         shell: bash
         run: git cliff --latest --strip header --output release-notes.md
 
-      - name: Package release
-        shell: pwsh
-        run: ./tools/Package-Release.ps1 -Version "${{ github.ref_name }}"
-
       - name: Publish GitHub release
         shell: bash
         env:

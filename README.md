@@ -214,7 +214,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the local and release workflow.
 
 ## Releases
 
-The project uses Conventional Commit-style prefixes and `git-cliff` to group changes. Pushing a tag matching `v*` runs the release workflow, generates release notes, packages the three PowerShell tools plus documentation, emits a SHA-256 checksum, and publishes the assets to GitHub Releases.
+The project uses Conventional Commit-style prefixes and `git-cliff` to group changes. Pushing a tag matching `v*` runs the release workflow, generates release notes, and publishes the three PowerShell scripts to GitHub Releases.
 
 See [RELEASING.md](RELEASING.md).
 

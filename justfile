@@ -30,7 +30,3 @@ changelog:
 # Print the version git-cliff would choose from commit history.
 next-version:
     git cliff --bumped-version
-
-# Build the release ZIP locally. VERSION may be overridden, e.g. `just package v0.2.0`.
-package VERSION="dev":
-    ./tools/Package-Release.ps1 -Version "{{VERSION}}"
