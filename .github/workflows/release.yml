@@ -52,8 +52,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            "dist/canary-historian-tools-${GITHUB_REF_NAME}.zip" \
-            "dist/canary-historian-tools-${GITHUB_REF_NAME}.zip.sha256" \
             "scripts/Benchmark-CanaryHistorian.ps1" \
             "scripts/Convert-CanaryJsonToCsv.ps1" \
             "scripts/Export-CanaryHistorian.ps1" \
