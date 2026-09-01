@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### <!-- 0 -->Features
+- Add parallel Canary batch export with runspace pool  ([5c9a000](https://github.com/marcelo-6/canary-historian-tools/commit/5c9a000041b94d929c1dcccdfb20bb18aded4ab2))
+
+
+### <!-- 3 -->Documentation
+- Explain export concepts and recommended settings  ([f044496](https://github.com/marcelo-6/canary-historian-tools/commit/f0444962cd114a519cb101fe1ddac4024e0e431d))
+
+
+### <!-- 7 -->Miscellaneous Tasks
+- Sync changelog with commits  by @marcelo-6 ([485a8f6](https://github.com/marcelo-6/canary-historian-tools/commit/485a8f63f60c4bb8aaeee17b5fdf04a98bbddc46))
+
+
 ## [0.1.4] - 2026-09-01
 
 ### <!-- 7 -->Miscellaneous Tasks
