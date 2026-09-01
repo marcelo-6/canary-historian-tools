@@ -90,6 +90,17 @@ A larger page size can reduce request/checkpoint overhead if the server and clie
     -MaxSizePerTag 50000
 ```
 
+Raw export runs parallel batch workers by default:
+
+```powershell
+.\scripts\Export-CanaryHistorian.ps1 `
+    -Server "http://localhost:55235" `
+    -OutputDirectory "E:\CanaryExport" `
+    -Parallelism 4
+```
+
+Each batch remains sequential internally. The exporter writes one page, checkpoints that batch, then requests the next continuation page for that same batch. `-Parallelism 1` uses the serial path.
+
 The default exclusion removes literal `{Diagnostics}` tags only. Paths containing words such as `System.Diagnostics` remain included unless you provide a different `-ExcludeRegex`.
 
 ### 3. Convert to CSV
@@ -149,13 +160,15 @@ CanaryExport/
       page-000001.json
 ```
 
-`Bxxxxx` directories are normal resolved multi-tag batches. `Uxxxxx` directories are single-tag fallback batches for tags whose historical context failed normal resolution. `export-plan.csv` records each included tag's resolved or fallback batch assignment before raw extraction starts. A `page-xxxxxx` file is one `getTagData2` response; later pages use Canary continuation tokens.
+`Bxxxxx` directories are normal resolved multi-tag batches. `Uxxxxx` directories are single-tag fallback batches for tags whose historical context failed normal resolution. `export-plan.csv` records each included tag's resolved or fallback batch assignment before raw extraction starts. A `page-xxxxxx` file is one `getTagData2` response; later pages use Canary continuation tokens. Parallel workers operate on separate batches, so page order is guaranteed inside a batch and interleaved across batches.
 
 See [Export format and recovery](docs/export-format.md) for the complete model.
 
 ## Resuming an interrupted export
 
 Run the same command against the same output directory. `state.json` stores batch status, page number, and continuation state. Finalized page files are checked before resume, and incomplete temporary files are ignored.
+
+`-Parallelism` and `-MaxSizePerTag` are stored in the final summary. Changing `-Parallelism` on resume is safe because it only changes how many independent batch pages run at once. Changing `-ExportBatchSize` or `-MaxSizePerTag` resets unfinished batches and keeps completed batches.
 
 Permanent raw tag failures such as `TagKey contains no TrendVectors` / `0x800403F8` are classified as unavailable after a raw history request returns that condition. Aggregate Count failures only disable Count-based estimates.
 

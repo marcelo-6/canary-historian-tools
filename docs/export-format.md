@@ -27,15 +27,21 @@ B00001/page-000002.json
         ...
 ```
 
+Parallel export does not change the file format. It only changes scheduling. Pages remain sequential inside each batch, while different batch directories can advance at the same time.
+
 ## State and audit files
 
 ### `state.json`
 
 Durable resume state. It records the export configuration and per-batch progress, including continuation/page state. It is updated only after successful page publication.
 
+`Parallelism` controls runtime scheduling only. Changing it on resume does not invalidate existing pages. Changing `ExportBatchSize` or `MaxSizePerTag` can alter unfinished work, so the exporter resets unfinished batch directories and retains completed batches.
+
 ### `pages.jsonl`
 
 Append-only audit metadata for committed pages. Use it to review counts, sizes, and timing without opening every JSON page.
+
+Parallel runs append page records as workers complete. This means `pages.jsonl` ordering can differ from batch/page ordering. Use `batchId` and `page` fields when reviewing it.
 
 ### `export-plan.csv`
 

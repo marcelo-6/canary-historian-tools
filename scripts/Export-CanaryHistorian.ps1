@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Robust, resumable, full-history exporter for the Canary Labs Views Read API.
+    Robust, resumable, parallel full-history exporter for the Canary Labs Views Read API.
 
 .DESCRIPTION
     PURPOSE
@@ -41,6 +41,43 @@
          (U00001, U00002, ... within the same global batch numbering sequence).
        * Each Canary response is one page. If Canary returns continuation tokens, the next request
          uses those tokens and produces the next page.
+
+    PARALLEL EXPORT ARCHITECTURE
+    ============================
+    Raw extraction can run multiple independent batches concurrently by using -Parallelism. The
+    unit of parallelism is a batch page, not multiple pages from the same batch:
+
+      B00001 page 1 -> page 2 -> page 3 ...   (sequential continuation chain)
+      B00002 page 1 -> page 2 -> page 3 ...   (runs concurrently with B00001)
+      B00003 page 1 -> page 2 -> page 3 ...
+
+    A page cannot be parallelized with later pages from its own batch because Canary continuation
+    for page N+1 is returned by page N. Different B/U batches have independent continuation chains
+    and independent output directories, so they can safely run in parallel.
+
+    The parallel implementation uses an in-process PowerShell RunspacePool so it works on Windows
+    PowerShell 5.1 as well as PowerShell 7+. Worker runspaces perform only the expensive page work:
+
+      * one raw getTagData2 request (with bounded retry/backoff);
+      * minimal response parsing for status, point count, and continuation;
+      * atomic page-file write;
+      * optional page hash.
+
+    Workers NEVER modify state.json, pages.jsonl, summary.json, or the shared log files. The main
+    coordinator is the sole writer for shared mutable state. After a worker reports that its page
+    file has been atomically published, the coordinator updates that batch's continuation/NextPage,
+    checkpoints state.json, appends pages.jsonl, and schedules the next page for that batch. This
+    preserves the serial exporter's commit ordering while allowing network/disk work to overlap.
+
+    -Parallelism defaults to 4. Use 1 for the original serial Export-Batch path. Parallelism is a
+    runtime tuning option and does not change batch/page semantics, so it may be changed when
+    resuming an existing output directory. Start with 2-4 and increase only while aggregate TVQ/s
+    continues to improve. Large responses consume significant memory while in flight; 8+ workers
+    with ~60 MB JSON pages can require multiple GB of process memory.
+
+    Windows PowerShell 5.1/.NET Framework can otherwise limit concurrent HTTP connections per
+    ServicePoint. Before the first API request, this script raises the connection limit to
+    -ConnectionLimit (or an automatic value of max(16, Parallelism*2)).
 
     BATCH AND PAGE DIRECTORY MEANING
     ================================
@@ -164,6 +201,17 @@
         -OutputDirectory ".\CanaryFullExport" `
         -MaxSizePerTag 50000
 
+.EXAMPLE
+    # Parallel raw export. Four independent batch pages may be in flight at once.
+    .\Export-CanaryHistorian.ps1 `
+        -Server "https://canary-server:55236" `
+        -ApiToken "YOUR-TOKEN" `
+        -OutputDirectory ".\CanaryFullExport" `
+        -Parallelism 4 `
+        -MaxSizePerTag 50000 `
+        -SkipCount `
+        -InsecureSkipCertificateCheck
+
 .NOTES
     Data payload: lossless Canary getTagData2 response pages.
     Default storage: raw UTF-8 JSON.
@@ -198,6 +246,16 @@ param(
     # For a fresh export, -MaxSizePerTag 50000 typically targets ~1,000,000 TVQs/page.
     [int]$ExportBatchSize = 20,
     [int]$MaxSizePerTag = 25000,
+
+    # Number of independent batch pages allowed in flight concurrently.
+    # 1 preserves the original serial Export-Batch path. Start with 2-4.
+    [ValidateRange(1, 32)]
+    [int]$Parallelism = 4,
+
+    # 0 = automatic max(16, Parallelism*2). This mainly matters for Windows
+    # PowerShell 5.1/.NET Framework ServicePoint connection throttling.
+    [ValidateRange(0, 256)]
+    [int]$ConnectionLimit = 0,
 
     # Raw JSON is the default because historian extraction is the critical path.
     # Compression can be done after the historian has been fully extracted.
@@ -246,6 +304,30 @@ if ($CountBatchSize -lt 1) { throw "CountBatchSize must be >= 1." }
 
 $BaseUrl = "$($Server.TrimEnd('/'))/api/v2"
 $IncludeQuality = -not $ExcludeQuality
+
+# Configure HTTP concurrency BEFORE the first request. This is important on
+# Windows PowerShell 5.1/.NET Framework, where the default per-ServicePoint
+# connection limit can otherwise serialize an apparently parallel workload.
+$script:EffectiveConnectionLimit = if ($ConnectionLimit -gt 0) {
+    [int]$ConnectionLimit
+}
+else {
+    [int][Math]::Max(16, $Parallelism * 2)
+}
+
+if ([System.Net.ServicePointManager]::DefaultConnectionLimit -lt $script:EffectiveConnectionLimit) {
+    [System.Net.ServicePointManager]::DefaultConnectionLimit = $script:EffectiveConnectionLimit
+}
+
+try {
+    $servicePoint = [System.Net.ServicePointManager]::FindServicePoint([Uri]$BaseUrl)
+    if ($servicePoint.ConnectionLimit -lt $script:EffectiveConnectionLimit) {
+        $servicePoint.ConnectionLimit = $script:EffectiveConnectionLimit
+    }
+}
+catch {
+    # Discovery will provide the actionable connection error later.
+}
 
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $DataDirectory = Join-Path $OutputDirectory "data"
@@ -342,6 +424,8 @@ function Write-Banner {
     Write-Host " Exclude regex:    $ExcludeRegex" -ForegroundColor Gray
     Write-Host " Export batch:     $ExportBatchSize tags" -ForegroundColor Gray
     Write-Host " Max/tag/request:  $MaxSizePerTag TVQs" -ForegroundColor Gray
+    Write-Host " Parallelism:      $Parallelism worker(s)" -ForegroundColor Gray
+    Write-Host " HTTP conn limit:  $script:EffectiveConnectionLimit" -ForegroundColor Gray
     Write-Host " Count buckets:    $CountBucketDays day(s)" -ForegroundColor Gray
     Write-Host " Output storage:   $(if ($OutputCompression -eq 'None') { 'raw JSON (.json)' } else { "gzip JSON (.json.gz, $OutputCompression)" })" -ForegroundColor Gray
     Write-Host " Include quality:  $IncludeQuality" -ForegroundColor Gray
@@ -1639,9 +1723,9 @@ function Add-PlanCount {
 function New-ExportPlan {
     param(
         [Parameter(Mandatory = $true)][object[]]$IncludedTags,
-        [Parameter(Mandatory = $true)][object[]]$Contexts,
-        [Parameter(Mandatory = $true)][object[]]$UnavailableTags,
-        [Parameter(Mandatory = $true)][object[]]$NoCountTags,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Contexts,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$UnavailableTags,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$NoCountTags,
         [Parameter(Mandatory = $true)][object[]]$Batches,
         [bool]$CountSkipped,
         [string]$CountSystemicFailure
@@ -2352,6 +2436,782 @@ function Export-Batch {
     }
 }
 
+
+# ========================= PARALLEL RAW EXPORT =========================
+#
+# The worker scriptblock performs exactly ONE page of one batch. It never
+# mutates shared state or shared logs. The coordinator below is the only writer
+# of state.json/pages.jsonl/log files. Keeping the worker page-scoped preserves
+# each batch's sequential continuation chain while allowing different batches
+# to overlap safely.
+$script:ExportPageWorkerScript = {
+    param(
+        [Parameter(Mandatory = $true)]$Work,
+        [Parameter(Mandatory = $true)]$Config
+    )
+
+    $ErrorActionPreference = "Stop"
+
+    function Test-WorkerContinuation {
+        param($Continuation)
+        if ($null -eq $Continuation) { return $false }
+        foreach ($item in @($Continuation)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$item)) { return $true }
+        }
+        return $false
+    }
+
+    function Test-WorkerPermanentFailure {
+        param(
+            [string]$Message,
+            [int]$HttpStatusCode = 0
+        )
+
+        if ($HttpStatusCode -eq 400 -or $HttpStatusCode -eq 401 -or
+            $HttpStatusCode -eq 403 -or $HttpStatusCode -eq 404) {
+            return $true
+        }
+
+        if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+
+        foreach ($pattern in @(
+            "does not exist or user does not have access",
+            "not authorized",
+            "unauthorized",
+            "forbidden",
+            "invalid api token",
+            "invalid token",
+            "Cannot represent an actual TimeSpan more than 1000 days",
+            "TagKey contains no TrendVectors",
+            "0x800403F8"
+        )) {
+            if ($Message.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return $true
+            }
+        }
+
+        return $false
+    }
+
+    function Get-WorkerPointCountFromParsedData {
+        param($Data)
+        if ($null -eq $Data) { return 0L }
+        $count = 0L
+        foreach ($property in $Data.PSObject.Properties) {
+            $count += @($property.Value).Count
+        }
+        return $count
+    }
+
+    function Convert-WorkerContinuationJson {
+        param([string]$ContinuationJson)
+        if ([string]::IsNullOrWhiteSpace($ContinuationJson)) { return $null }
+        if ($ContinuationJson.Trim().Equals("null", [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+        return @(($ContinuationJson | ConvertFrom-Json))
+    }
+
+    function Write-WorkerRawUtf8Atomic {
+        param([string]$Path, [string]$Content)
+
+        $parent = Split-Path -Parent $Path
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        $tempPath = "$Path.tmp.$PID.$([Guid]::NewGuid().ToString('N'))"
+        $fileStream = $null
+        $writer = $null
+
+        try {
+            $fileStream = New-Object System.IO.FileStream(
+                $tempPath,
+                [System.IO.FileMode]::Create,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None,
+                1048576,
+                [System.IO.FileOptions]::SequentialScan
+            )
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            $writer = New-Object System.IO.StreamWriter($fileStream, $utf8NoBom, 1048576, $false)
+            $writer.Write($Content)
+            $writer.Flush()
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $fileStream) { $fileStream.Dispose() }
+        }
+
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force
+        return (Get-Item -LiteralPath $Path).Length
+    }
+
+    function Write-WorkerGzipUtf8Atomic {
+        param([string]$Path, [string]$Content, [string]$LevelName)
+
+        $parent = Split-Path -Parent $Path
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        $tempPath = "$Path.tmp.$PID.$([Guid]::NewGuid().ToString('N'))"
+        $fileStream = $null
+        $gzipStream = $null
+        $writer = $null
+
+        try {
+            $fileStream = New-Object System.IO.FileStream(
+                $tempPath,
+                [System.IO.FileMode]::Create,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None,
+                1048576,
+                [System.IO.FileOptions]::SequentialScan
+            )
+            $level = [System.Enum]::Parse([System.IO.Compression.CompressionLevel], $LevelName, $true)
+            $gzipStream = New-Object System.IO.Compression.GZipStream($fileStream, $level, $false)
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            $writer = New-Object System.IO.StreamWriter($gzipStream, $utf8NoBom, 1048576, $false)
+            $writer.Write($Content)
+            $writer.Flush()
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+            elseif ($null -ne $gzipStream) { $gzipStream.Dispose() }
+            elseif ($null -ne $fileStream) { $fileStream.Dispose() }
+        }
+
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force
+        return (Get-Item -LiteralPath $Path).Length
+    }
+
+    function Add-WorkerAuthentication {
+        param([hashtable]$Body)
+        if (-not [string]::IsNullOrWhiteSpace([string]$Config.ApiToken)) {
+            $Body["apiToken"] = [string]$Config.ApiToken
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace([string]$Config.AccessToken)) {
+            $Body["accessToken"] = [string]$Config.AccessToken
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace([string]$Config.UserToken)) {
+            $Body["userToken"] = [string]$Config.UserToken
+        }
+    }
+
+    $pageStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $retries = New-Object System.Collections.ArrayList
+    $content = $null
+    $responseBytes = 0L
+    $pointCount = 0L
+    $continuation = $null
+    $apiSeconds = 0.0
+    $parseSeconds = 0.0
+    $parserName = "unknown"
+    $successfulAttempt = 0
+
+    $body = @{
+        tags = @($Work.Tags)
+        startTime = [string]$Work.StartTime
+        endTime = [string]$Work.EndTime
+        includeQuality = [bool]$Config.IncludeQuality
+        includeBounds = $false
+        maxSize = [int]$Config.MaxSizePerTag
+    }
+    if (Test-WorkerContinuation $Work.RequestContinuation) {
+        $body["continuation"] = @($Work.RequestContinuation)
+    }
+    Add-WorkerAuthentication -Body $body
+    $json = $body | ConvertTo-Json -Depth 20 -Compress
+
+    for ($attempt = 1; $attempt -le [int]$Config.MaxAttempts; $attempt++) {
+        $failureMessage = $null
+        $httpStatus = 0
+        $permanent = $false
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+        try {
+            $requestParams = @{
+                Uri = "$($Config.BaseUrl)/getTagData2"
+                Method = "POST"
+                ContentType = "application/json"
+                Body = $json
+            }
+            if ($PSVersionTable.PSVersion.Major -lt 6) {
+                $requestParams["UseBasicParsing"] = $true
+            }
+            if ([bool]$Config.InsecureSkipCertificateCheck -and $PSVersionTable.PSVersion.Major -ge 7) {
+                $requestParams["SkipCertificateCheck"] = $true
+            }
+
+            $response = Invoke-WebRequest @requestParams
+            $sw.Stop()
+            $apiSeconds = $sw.Elapsed.TotalSeconds
+            $content = [string]$response.Content
+            $responseBytes = [long][System.Text.Encoding]::UTF8.GetByteCount($content)
+
+            $parsed = $null
+            $usedFast = $false
+            if ([bool]$Config.FastRawParserAvailable -and ("CanaryFastJson" -as [type])) {
+                $parseSw = [System.Diagnostics.Stopwatch]::StartNew()
+                $meta = [CanaryFastJson]::Parse($content)
+                $parseSw.Stop()
+                $parseSeconds = $parseSw.Elapsed.TotalSeconds
+
+                if (-not [string]::IsNullOrWhiteSpace($meta.StatusCode) -and $meta.StatusCode -eq "Good") {
+                    $pointCount = [long]$meta.PointCount
+                    $continuation = Convert-WorkerContinuationJson -ContinuationJson $meta.ContinuationJson
+                    $parserName = "compiled-fast"
+                    $usedFast = $true
+                }
+            }
+
+            if (-not $usedFast) {
+                $parseSw = [System.Diagnostics.Stopwatch]::StartNew()
+                $parsed = $content | ConvertFrom-Json
+                $parseSw.Stop()
+                $parseSeconds = $parseSw.Elapsed.TotalSeconds
+                $parserName = "ConvertFrom-Json"
+
+                if ($parsed.statusCode -and $parsed.statusCode -ne "Good") {
+                    $failureMessage = "Canary status '$($parsed.statusCode)': $($parsed.errors -join '; ')"
+                    $permanent = Test-WorkerPermanentFailure -Message $failureMessage
+                }
+                else {
+                    $pointCount = [long](Get-WorkerPointCountFromParsedData -Data $parsed.data)
+                    $continuation = $parsed.continuation
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($failureMessage)) {
+                $successfulAttempt = $attempt
+                break
+            }
+        }
+        catch {
+            if ($sw.IsRunning) { $sw.Stop() }
+            $failureMessage = $_.Exception.Message
+            try {
+                if ($null -ne $_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
+                    $httpStatus = [int]$_.Exception.Response.StatusCode
+                }
+            }
+            catch { }
+            $permanent = Test-WorkerPermanentFailure -Message $failureMessage -HttpStatusCode $httpStatus
+        }
+
+        if ($permanent) {
+            $pageStopwatch.Stop()
+            return [PSCustomObject]@{
+                Status = "PermanentFailure"
+                BatchId = [string]$Work.BatchId
+                Page = [int]$Work.Page
+                Error = "Permanent failure during $($Work.BatchId) page $($Work.Page): $failureMessage"
+                Retries = @($retries)
+                EndToEndSeconds = $pageStopwatch.Elapsed.TotalSeconds
+            }
+        }
+
+        if ($attempt -ge [int]$Config.MaxAttempts) {
+            $pageStopwatch.Stop()
+            return [PSCustomObject]@{
+                Status = "Failed"
+                BatchId = [string]$Work.BatchId
+                Page = [int]$Work.Page
+                Error = "Failed after $($Config.MaxAttempts) attempts during $($Work.BatchId) page $($Work.Page): $failureMessage"
+                Retries = @($retries)
+                EndToEndSeconds = $pageStopwatch.Elapsed.TotalSeconds
+            }
+        }
+
+        $exponential = [double]$Config.RetryBaseDelaySeconds * [Math]::Pow(2, $attempt - 1)
+        $bounded = [Math]::Min([double]$Config.RetryMaxDelaySeconds, $exponential)
+        $jitterMs = Get-Random -Minimum 100 -Maximum 1000
+        $delay = $bounded + ($jitterMs / 1000.0)
+        [void]$retries.Add([PSCustomObject]@{
+            Attempt = $attempt
+            MaxAttempts = [int]$Config.MaxAttempts
+            DelaySeconds = $delay
+            HttpStatus = $httpStatus
+            Error = $failureMessage
+        })
+        Start-Sleep -Milliseconds ([int]($delay * 1000))
+    }
+
+    if ($successfulAttempt -le 0 -or $null -eq $content) {
+        $pageStopwatch.Stop()
+        return [PSCustomObject]@{
+            Status = "Failed"
+            BatchId = [string]$Work.BatchId
+            Page = [int]$Work.Page
+            Error = "Worker exited without a successful raw response."
+            Retries = @($retries)
+            EndToEndSeconds = $pageStopwatch.Elapsed.TotalSeconds
+        }
+    }
+
+    try {
+        $writeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        if ([string]$Config.OutputCompression -eq "None") {
+            $storedBytes = Write-WorkerRawUtf8Atomic -Path ([string]$Work.FilePath) -Content $content
+        }
+        else {
+            $storedBytes = Write-WorkerGzipUtf8Atomic -Path ([string]$Work.FilePath) -Content $content -LevelName ([string]$Config.OutputCompression)
+        }
+        $writeStopwatch.Stop()
+
+        $hashStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $sha256 = $null
+        if ([bool]$Config.EnableHashes) {
+            $sha256 = (Get-FileHash -LiteralPath ([string]$Work.FilePath) -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        $hashStopwatch.Stop()
+    }
+    catch {
+        $pageStopwatch.Stop()
+        return [PSCustomObject]@{
+            Status = "DiskFailure"
+            BatchId = [string]$Work.BatchId
+            Page = [int]$Work.Page
+            Error = "Disk write failed for $($Work.FilePath): $($_.Exception.Message)"
+            Retries = @($retries)
+            EndToEndSeconds = $pageStopwatch.Elapsed.TotalSeconds
+        }
+    }
+
+    $pageStopwatch.Stop()
+    return [PSCustomObject]@{
+        Status = "Success"
+        BatchId = [string]$Work.BatchId
+        BatchKind = [string]$Work.BatchKind
+        Page = [int]$Work.Page
+        FileName = [string]$Work.FileName
+        FilePath = [string]$Work.FilePath
+        TagCount = @($Work.Tags).Count
+        PointCount = [long]$pointCount
+        ResponseBytes = [long]$responseBytes
+        StoredBytes = [long]$storedBytes
+        Continuation = $continuation
+        ApiSeconds = [double]$apiSeconds
+        ParseSeconds = [double]$parseSeconds
+        WriteSeconds = [double]$writeStopwatch.Elapsed.TotalSeconds
+        HashSeconds = [double]$hashStopwatch.Elapsed.TotalSeconds
+        EndToEndSeconds = [double]$pageStopwatch.Elapsed.TotalSeconds
+        Attempt = [int]$successfulAttempt
+        Parser = [string]$parserName
+        Sha256 = $sha256
+        Retries = @($retries)
+    }
+}
+
+function Get-ParallelWorkerConfig {
+    [PSCustomObject]@{
+        BaseUrl = $BaseUrl
+        ApiToken = $ApiToken
+        AccessToken = $AccessToken
+        UserToken = $UserToken
+        IncludeQuality = [bool]$IncludeQuality
+        MaxSizePerTag = [int]$MaxSizePerTag
+        OutputCompression = [string]$OutputCompression
+        EnableHashes = [bool]$EnableHashes
+        MaxAttempts = [int]$MaxAttempts
+        RetryBaseDelaySeconds = [double]$RetryBaseDelaySeconds
+        RetryMaxDelaySeconds = [double]$RetryMaxDelaySeconds
+        InsecureSkipCertificateCheck = [bool]$InsecureSkipCertificateCheck
+        FastRawParserAvailable = [bool]$script:FastRawParserAvailable
+    }
+}
+
+function New-ParallelPageWorkItem {
+    param([Parameter(Mandatory = $true)]$Batch)
+
+    $page = [int]$Batch.NextPage
+    $fileName = if ($OutputCompression -eq "None") {
+        "page-{0:D6}.json" -f $page
+    }
+    else {
+        "page-{0:D6}.json.gz" -f $page
+    }
+    $batchDir = Join-Path $DataDirectory $Batch.Id
+    $filePath = Join-Path $batchDir $fileName
+
+    [PSCustomObject]@{
+        BatchId = [string]$Batch.Id
+        BatchKind = [string]$Batch.Kind
+        Tags = @($Batch.Tags)
+        StartTime = [string]$Batch.StartTime
+        EndTime = [string]$Batch.EndTime
+        Page = $page
+        FileName = $fileName
+        FilePath = $filePath
+        RequestContinuation = $(if (Test-Continuation $Batch.Continuation) {
+            @(Convert-ContinuationForRequest -Continuation $Batch.Continuation)
+        } else { $null })
+    }
+}
+
+function Write-ParallelRetryRecords {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][string]$Operation
+    )
+
+    foreach ($retry in @($Result.Retries)) {
+        if ($null -eq $retry) { continue }
+        Write-Log -Level "RETRY" -Event "request_retry" -Message (
+            "$Operation failed on attempt $($retry.Attempt)/$($retry.MaxAttempts). Retried after $([Math]::Round([double]$retry.DelaySeconds, 1))s. $($retry.Error)"
+        ) -Data @{
+            operation = $Operation
+            attempt = [int]$retry.Attempt
+            maxAttempts = [int]$retry.MaxAttempts
+            delaySeconds = [double]$retry.DelaySeconds
+            httpStatus = [int]$retry.HttpStatus
+        }
+    }
+}
+
+function Get-ParallelProgressSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch]$RunStopwatch,
+        [Parameter(Mandatory = $true)][int]$TotalBatches
+    )
+
+    $allPoints = 0L
+    $allRawBytes = 0L
+    $allStoredBytes = 0L
+    $completeBatches = 0
+    foreach ($b in @($State.Batches)) {
+        $allPoints += [long]$b.PointsWritten
+        $allRawBytes += [long]$b.RawBytes
+        $allStoredBytes += [long]$b.CompressedBytes
+        if ($b.Status -eq "Complete") { $completeBatches++ }
+    }
+
+    $runtimeSeconds = [Math]::Max(0.001, $RunStopwatch.Elapsed.TotalSeconds)
+    $runPoints = [Math]::Max(0.0, [double]$allPoints - [double]$script:RunBaselinePoints)
+    $e2eRate = $runPoints / $runtimeSeconds
+    $etaText = "unknown"
+    $pctText = "n/a"
+
+    if ([double]$State.ExpectedPoints -gt 0 -and $allPoints -gt 0) {
+        $pct = [Math]::Min(100.0, 100.0 * $allPoints / [double]$State.ExpectedPoints)
+        $remaining = [Math]::Max(0.0, [double]$State.ExpectedPoints - $allPoints)
+        if ($e2eRate -gt 0) { $etaText = Format-Duration ($remaining / $e2eRate) }
+        $pctText = ("{0:N1}%" -f $pct)
+    }
+    elseif ($TotalBatches -gt 0) {
+        $pctText = ("{0:N1}% batches" -f (100.0 * $completeBatches / $TotalBatches))
+    }
+
+    [PSCustomObject]@{
+        AllPoints = $allPoints
+        AllRawBytes = $allRawBytes
+        AllStoredBytes = $allStoredBytes
+        CompleteBatches = $completeBatches
+        RunPoints = $runPoints
+        EndToEndRate = $e2eRate
+        ProgressText = $pctText
+        EtaText = $etaText
+    }
+}
+
+function Complete-ParallelPageResult {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Batch,
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][int]$TotalBatches,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch]$RunStopwatch
+    )
+
+    $operation = "$($Batch.Id) page $($Result.Page)"
+    Write-ParallelRetryRecords -Result $Result -Operation $operation
+
+    if ([string]$Result.Status -ne "Success") {
+        $Batch.LastError = [string]$Result.Error
+        if ([string]$Result.Status -eq "PermanentFailure" -and $Batch.Kind -eq "context-fallback") {
+            $Batch.Status = "Unavailable"
+            Save-State -State $State
+            Write-Log -Level "WARN" -Event "fallback_unavailable" -Message (
+                "$($Batch.Id) could not be exported because Canary reports the tag as permanently unavailable. It will not be retried automatically. $($Batch.LastError)"
+            ) -Data @{
+                batchId = $Batch.Id
+                page = [int]$Result.Page
+                tags = @($Batch.Tags)
+                error = $Batch.LastError
+            }
+            return
+        }
+
+        $Batch.Status = "Failed"
+        Save-State -State $State
+        $eventName = if ([string]$Result.Status -eq "DiskFailure") { "disk_write_failed" } else { "batch_failed" }
+        Write-Log -Level "ERROR" -Event $eventName -Message (
+            "$($Batch.Id) page $($Result.Page) failed and was checkpointed for resume. $($Batch.LastError)"
+        ) -Data @{
+            batchId = $Batch.Id
+            page = [int]$Result.Page
+            error = $Batch.LastError
+        }
+        return
+    }
+
+    $expectedPage = [int]$Batch.NextPage
+    if ([int]$Result.Page -ne $expectedPage) {
+        $Batch.Status = "Failed"
+        $Batch.LastError = "Parallel coordinator page mismatch for $($Batch.Id): expected page $expectedPage but worker returned page $($Result.Page)."
+        Save-State -State $State
+        Write-Log -Level "ERROR" -Event "parallel_page_mismatch" -Message $Batch.LastError
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath ([string]$Result.FilePath)) -or
+        (Get-Item -LiteralPath ([string]$Result.FilePath)).Length -le 0) {
+        $Batch.Status = "Failed"
+        $Batch.LastError = "Parallel worker reported success but the committed page file is missing or empty: $($Result.FilePath)"
+        Save-State -State $State
+        Write-Log -Level "ERROR" -Event "parallel_page_missing" -Message $Batch.LastError
+        return
+    }
+
+    $Batch.PointsWritten = [long]$Batch.PointsWritten + [long]$Result.PointCount
+    $Batch.RawBytes = [long]$Batch.RawBytes + [long]$Result.ResponseBytes
+    $Batch.CompressedBytes = [long]$Batch.CompressedBytes + [long]$Result.StoredBytes
+    if ($null -eq $Result.Continuation) {
+        $Batch.Continuation = $null
+    }
+    else {
+        $Batch.Continuation = @($Result.Continuation)
+    }
+    $Batch.NextPage = [int]$Result.Page + 1
+    $Batch.LastError = $null
+
+    $hasMore = Test-Continuation $Batch.Continuation
+    if ($hasMore) { $Batch.Status = "InProgress" } else { $Batch.Status = "Complete" }
+
+    # State commit remains coordinator-only and occurs only after the worker's
+    # atomically published page is verified on disk.
+    Save-State -State $State
+
+    Write-PageManifestRecord -Record @{
+        timestampUtc = (Get-Date).ToUniversalTime().ToString("o")
+        batchId = $Batch.Id
+        batchKind = $Batch.Kind
+        page = [int]$Result.Page
+        file = ("data/{0}/{1}" -f $Batch.Id, $Result.FileName)
+        tagCount = @($Batch.Tags).Count
+        points = [long]$Result.PointCount
+        rawBytes = [long]$Result.ResponseBytes
+        storedBytes = [long]$Result.StoredBytes
+        outputCompression = $OutputCompression
+        apiSeconds = [double]$Result.ApiSeconds
+        parseSeconds = [double]$Result.ParseSeconds
+        writeSeconds = [double]$Result.WriteSeconds
+        hashSeconds = [double]$Result.HashSeconds
+        parser = [string]$Result.Parser
+        endToEndSeconds = [double]$Result.EndToEndSeconds
+        attempt = [int]$Result.Attempt
+        sha256 = $Result.Sha256
+        parallelism = [int]$Parallelism
+    }
+
+    $progress = Get-ParallelProgressSnapshot -State $State -RunStopwatch $RunStopwatch -TotalBatches $TotalBatches
+    $storedMb = [double]$Result.StoredBytes / 1MB
+    $rawMb = [double]$Result.ResponseBytes / 1MB
+    $apiRate = 0.0
+    if ([double]$Result.ApiSeconds -gt 0) { $apiRate = [double]$Result.PointCount / [double]$Result.ApiSeconds }
+    $storageText = if ($OutputCompression -eq "None") {
+        "$([Math]::Round($storedMb, 1)) MB json"
+    }
+    else {
+        "$([Math]::Round($storedMb, 1)) MB gz"
+    }
+
+    Write-Log -Level "DATA" -Event "page_written" -Message (
+        "$($Batch.Id) p$($Result.Page) | $(([long]$Result.PointCount).ToString('N0')) TVQs | $([Math]::Round($rawMb, 1)) MB API -> $storageText | API $([Math]::Round([double]$Result.ApiSeconds, 2))s | parse $([Math]::Round([double]$Result.ParseSeconds, 2))s | write $([Math]::Round([double]$Result.WriteSeconds, 2))s | page $([Math]::Round([double]$Result.EndToEndSeconds, 2))s | $([Math]::Round($apiRate, 0).ToString('N0')) TVQ/s API | aggregate $([Math]::Round([double]$progress.EndToEndRate, 0).ToString('N0')) TVQ/s | progress $($progress.ProgressText) | ETA $($progress.EtaText)"
+    ) -Data @{
+        batchId = $Batch.Id
+        page = [int]$Result.Page
+        points = [long]$Result.PointCount
+        apiSeconds = [double]$Result.ApiSeconds
+        parseSeconds = [double]$Result.ParseSeconds
+        writeSeconds = [double]$Result.WriteSeconds
+        hashSeconds = [double]$Result.HashSeconds
+        parser = [string]$Result.Parser
+        endToEndSeconds = [double]$Result.EndToEndSeconds
+        rawBytes = [long]$Result.ResponseBytes
+        storedBytes = [long]$Result.StoredBytes
+        outputCompression = $OutputCompression
+        progress = $progress.ProgressText
+        eta = $progress.EtaText
+        aggregateTvqPerSecond = [double]$progress.EndToEndRate
+        completedBatches = [int]$progress.CompleteBatches
+        totalBatches = $TotalBatches
+        parallelism = $Parallelism
+    }
+
+    if (-not $hasMore) {
+        Write-Log -Level "OK" -Event "batch_complete" -Message (
+            "$($Batch.Id) complete: $(([long]$Batch.PointsWritten).ToString('N0')) TVQs in $($Batch.NextPage - 1) page(s)."
+        )
+    }
+}
+
+function Invoke-ParallelExport {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch]$RunStopwatch
+    )
+
+    $totalBatches = @($State.Batches).Count
+    $workerConfig = Get-ParallelWorkerConfig
+    $batchById = @{}
+    $ordinalById = @{}
+    $ordinal = 0
+    foreach ($batch in @($State.Batches)) {
+        $ordinal++
+        $batchById[[string]$batch.Id] = $batch
+        $ordinalById[[string]$batch.Id] = $ordinal
+    }
+
+    $eligibleRetryFailedIds = @{}
+    if ($RetryFailedOnly) {
+        foreach ($batch in @($State.Batches | Where-Object { $_.Status -eq "Failed" })) {
+            $eligibleRetryFailedIds[[string]$batch.Id] = $true
+        }
+    }
+
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $Parallelism)
+    $pool.Open()
+    $activeJobs = New-Object System.Collections.ArrayList
+    $activeByBatch = @{}
+    # A batch that exhausts its retries during this invocation is not scheduled
+    # again until the user reruns the exporter, matching the original serial
+    # Export-Batch behavior. Without this guard, a Failed batch would become
+    # immediately runnable again and could loop forever in one invocation.
+    $blockedThisRun = @{}
+    $startedThisRun = @{}
+
+    Write-Log -Level "INFO" -Event "parallel_export_start" -Message (
+        "Starting parallel raw export with $Parallelism worker(s) and HTTP connection limit $script:EffectiveConnectionLimit. Each batch remains sequential internally."
+    ) -Data @{
+        parallelism = $Parallelism
+        connectionLimit = $script:EffectiveConnectionLimit
+        totalBatches = $totalBatches
+    }
+
+    try {
+        while ($true) {
+            # Fill every available runspace slot with a distinct runnable batch.
+            foreach ($batch in @($State.Batches)) {
+                if ($activeJobs.Count -ge $Parallelism) { break }
+
+                $batchId = [string]$batch.Id
+                if ($activeByBatch.ContainsKey($batchId)) { continue }
+                if ($blockedThisRun.ContainsKey($batchId)) { continue }
+                if ($batch.Status -eq "Complete" -or $batch.Status -eq "Unavailable") { continue }
+                if ($RetryFailedOnly -and -not $eligibleRetryFailedIds.ContainsKey($batchId)) { continue }
+
+                # Failed batches are retried on a normal resume. Pending/InProgress
+                # batches continue from their persisted NextPage/Continuation.
+                if ($batch.Status -ne "Pending" -and $batch.Status -ne "InProgress" -and $batch.Status -ne "Failed") {
+                    continue
+                }
+
+                $work = New-ParallelPageWorkItem -Batch $batch
+                $ps = [System.Management.Automation.PowerShell]::Create()
+                $ps.RunspacePool = $pool
+                [void]$ps.AddScript($script:ExportPageWorkerScript.ToString())
+                [void]$ps.AddArgument($work)
+                [void]$ps.AddArgument($workerConfig)
+
+                $previousStatus = [string]$batch.Status
+                $handle = $ps.BeginInvoke()
+                [void]$activeJobs.Add([PSCustomObject]@{
+                    PowerShell = $ps
+                    Handle = $handle
+                    BatchId = $batchId
+                    Page = [int]$work.Page
+                })
+                $activeByBatch[$batchId] = $true
+
+                if (-not $startedThisRun.ContainsKey($batchId)) {
+                    $startedThisRun[$batchId] = $true
+                    Write-Log -Level "INFO" -Event "batch_start" -Message (
+                        "[$($ordinalById[$batchId])/$totalBatches] Starting $batchId ($($batch.Kind)), $(@($batch.Tags).Count) tag(s), page $($batch.NextPage) on a parallel worker."
+                    ) -Data @{
+                        batchId = $batchId
+                        ordinal = [int]$ordinalById[$batchId]
+                        totalBatches = $totalBatches
+                        tagCount = @($batch.Tags).Count
+                        nextPage = [int]$batch.NextPage
+                        kind = [string]$batch.Kind
+                        previousStatus = $previousStatus
+                    }
+                }
+            }
+
+            if ($activeJobs.Count -eq 0) {
+                # No active work and no new task could be scheduled means the
+                # selected run is finished (or RetryFailedOnly selected nothing).
+                break
+            }
+
+            $completed = @($activeJobs | Where-Object { $_.Handle.IsCompleted })
+            if ($completed.Count -eq 0) {
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+
+            foreach ($job in $completed) {
+                $batchId = [string]$job.BatchId
+                $batch = $batchById[$batchId]
+                $result = $null
+
+                try {
+                    $outputs = @($job.PowerShell.EndInvoke($job.Handle))
+                    if ($outputs.Count -gt 0) {
+                        $result = $outputs[$outputs.Count - 1]
+                    }
+                }
+                catch {
+                    $result = [PSCustomObject]@{
+                        Status = "Failed"
+                        BatchId = $batchId
+                        Page = [int]$job.Page
+                        Error = "Parallel worker pipeline failed: $($_.Exception.Message)"
+                        Retries = @()
+                        EndToEndSeconds = 0.0
+                    }
+                }
+                finally {
+                    $job.PowerShell.Dispose()
+                    [void]$activeByBatch.Remove($batchId)
+                    [void]$activeJobs.Remove($job)
+                }
+
+                if ($null -eq $result) {
+                    $result = [PSCustomObject]@{
+                        Status = "Failed"
+                        BatchId = $batchId
+                        Page = [int]$job.Page
+                        Error = "Parallel worker completed without returning a result."
+                        Retries = @()
+                        EndToEndSeconds = 0.0
+                    }
+                }
+
+                Complete-ParallelPageResult -State $State -Batch $batch -Result $result -TotalBatches $totalBatches -RunStopwatch $RunStopwatch
+
+                if ($batch.Status -eq "Failed" -or $batch.Status -eq "Unavailable") {
+                    $blockedThisRun[$batchId] = $true
+                }
+            }
+        }
+    }
+    finally {
+        foreach ($job in @($activeJobs)) {
+            try { $job.PowerShell.Stop() } catch { }
+            try { $job.PowerShell.Dispose() } catch { }
+        }
+        try { $pool.Close() } catch { }
+        try { $pool.Dispose() } catch { }
+    }
+}
+
 function Write-FinalSummary {
     param(
         [Parameter(Mandatory = $true)]$State,
@@ -2426,6 +3286,8 @@ function Write-FinalSummary {
         outputCompressionCurrentRun = $OutputCompression
         elapsedSecondsThisRun = $elapsed
         endToEndTvqPerSecondThisRun = $rate
+        parallelismThisRun = $Parallelism
+        httpConnectionLimitThisRun = $script:EffectiveConnectionLimit
         includeQuality = $State.IncludeQuality
         countBucketDays = $(if ($null -ne $State.PSObject.Properties["CountBucketDays"]) { $State.CountBucketDays } else { $CountBucketDays })
         historicalStart = $State.HistoricalStart
@@ -2486,7 +3348,7 @@ if ($InsecureSkipCertificateCheck) {
 
 Write-Log -Level "INFO" -Event "run_start" -Message "Starting Canary historian export using PowerShell $($PSVersionTable.PSVersion)."
 Write-Log -Level "INFO" -Event "performance_mode" -Message (
-    "Raw parser: $(if ($script:FastRawParserAvailable) { 'compiled-fast' } else { 'ConvertFrom-Json fallback' }); storage: $(if ($OutputCompression -eq 'None') { 'raw-json' } else { "gzip-$OutputCompression" }); maxSize/tag: $MaxSizePerTag."
+    "Raw parser: $(if ($script:FastRawParserAvailable) { 'compiled-fast' } else { 'ConvertFrom-Json fallback' }); storage: $(if ($OutputCompression -eq 'None') { 'raw-json' } else { "gzip-$OutputCompression" }); maxSize/tag: $MaxSizePerTag; parallelism: $Parallelism; HTTP connection limit: $script:EffectiveConnectionLimit."
 )
 
 $state = $null
@@ -2547,20 +3409,26 @@ foreach ($existingBatch in $state.Batches) {
 
 $runStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $totalBatches = @($state.Batches).Count
-$ordinal = 0
 
-foreach ($batch in $state.Batches) {
-    $ordinal++
+if ($Parallelism -le 1) {
+    Write-Log -Level "INFO" -Event "serial_export_mode" -Message "Parallelism is 1; using the original serial Export-Batch path."
+    $ordinal = 0
+    foreach ($batch in $state.Batches) {
+        $ordinal++
 
-    if ($batch.Status -eq "Complete") {
-        continue
+        if ($batch.Status -eq "Complete") {
+            continue
+        }
+
+        if ($RetryFailedOnly -and $batch.Status -ne "Failed") {
+            continue
+        }
+
+        [void](Export-Batch -State $state -Batch $batch -BatchOrdinal $ordinal -TotalBatches $totalBatches -RunStopwatch $runStopwatch)
     }
-
-    if ($RetryFailedOnly -and $batch.Status -ne "Failed") {
-        continue
-    }
-
-    [void](Export-Batch -State $state -Batch $batch -BatchOrdinal $ordinal -TotalBatches $totalBatches -RunStopwatch $runStopwatch)
+}
+else {
+    Invoke-ParallelExport -State $state -RunStopwatch $runStopwatch
 }
 
 $runStopwatch.Stop()
