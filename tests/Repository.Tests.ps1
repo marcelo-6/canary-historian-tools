@@ -46,6 +46,18 @@ Describe 'Exporter safety behavior' {
         $script:exporterContent | Should -Match 'CountBucketDays'
         $script:exporterContent | Should -Match 'ValidateRange\(1, 999\)'
     }
+
+    It 'validates export-plan coverage before raw export' {
+        $script:exporterContent | Should -Match 'export-plan\.csv'
+        $script:exporterContent | Should -Match 'Assert-ExportPlanCoverage'
+        $script:exporterContent | Should -Match 'Export plan validated'
+    }
+
+    It 'keeps Count failures separate from export eligibility' {
+        $script:exporterContent | Should -Match 'Test-SystemicCountFailure'
+        $script:exporterContent | Should -Match 'Raw export eligibility is unaffected'
+        $script:exporterContent | Should -Match '-Attempts 1'
+    }
 }
 
 Describe 'Converter output modes' {

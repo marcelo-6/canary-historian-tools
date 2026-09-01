@@ -64,6 +64,7 @@
       state.json                Durable resume checkpoint and per-batch state.
       pages.jsonl               Append-only audit record for successfully committed pages.
       tag-inventory.csv         Tag context/count inventory.
+      export-plan.csv           Per-tag assignment to a resolved or fallback raw export batch.
       excluded-tags.csv         Tags removed by -ExcludeRegex.
       unavailable-tags.csv      Context-unresolved tags discovered during setup.
       tags-without-count.csv    Tags for which Count could not be obtained.
@@ -251,6 +252,8 @@ $DataDirectory = Join-Path $OutputDirectory "data"
 $LogsDirectory = Join-Path $OutputDirectory "logs"
 $StatePath = Join-Path $OutputDirectory "state.json"
 $InventoryPath = Join-Path $OutputDirectory "tag-inventory.csv"
+$ExportPlanPath = Join-Path $OutputDirectory "export-plan.csv"
+$ExportPlanFailurePath = Join-Path $OutputDirectory "export-plan-validation-failures.csv"
 $ExcludedPath = Join-Path $OutputDirectory "excluded-tags.csv"
 $UnavailablePath = Join-Path $OutputDirectory "unavailable-tags.csv"
 $NoCountPath = Join-Path $OutputDirectory "tags-without-count.csv"
@@ -373,6 +376,22 @@ function Get-Batches {
         $last = [Math]::Min($i + $Size - 1, $Items.Count - 1)
         ,@($Items[$i..$last])
     }
+}
+
+function Get-UniqueStringsOrdinal {
+    param([object[]]$Items)
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $unique = New-Object System.Collections.ArrayList
+
+    foreach ($item in @($Items)) {
+        $value = [string]$item
+        if ($seen.Add($value)) {
+            [void]$unique.Add($value)
+        }
+    }
+
+    @($unique | Sort-Object)
 }
 
 
@@ -914,6 +933,14 @@ function Test-TagSpecificFailure {
     return $Message -match '(?i)(tag does not exist|does not have access to tag|user does not have access to tag|TagKey contains no TrendVectors|0x800403F8|Error reading data for tag)'
 }
 
+function Test-SystemicCountFailure {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+
+    return $Message -match '(?i)(GetAggregateDataAsync|NoLicense|aggregate processing|aggregateName)'
+}
+
 function Test-PermanentFailure {
     param(
         [string]$Message,
@@ -1108,6 +1135,33 @@ function Get-PointCountFromParsedData {
 }
 
 $script:UnavailableTags = New-Object System.Collections.ArrayList
+$script:NoCountTags = New-Object System.Collections.ArrayList
+
+function Add-UnavailableTag {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$Error
+    )
+
+    [void]$script:UnavailableTags.Add([PSCustomObject]@{
+        Tag = $Tag
+        Stage = $Stage
+        Error = $Error
+    })
+}
+
+function Add-NoCountTag {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    [void]$script:NoCountTags.Add([PSCustomObject]@{
+        Tag = $Tag
+        Reason = $Reason
+    })
+}
 
 function Get-CanaryTagContextResilient {
     param([Parameter(Mandatory = $true)][object[]]$Tags)
@@ -1119,34 +1173,85 @@ function Get-CanaryTagContextResilient {
             tags = @($Tags)
         } -Operation "getTagContext ($($Tags.Count) tags)"
 
+        $returnedTags = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+
         foreach ($item in @($result.Parsed.data)) {
             $oldest = $null
             $latest = $null
+            $tagName = ""
 
-            if ($item.tagContext.oldestTimeStamp) {
-                $oldest = [DateTimeOffset]::Parse($item.tagContext.oldestTimeStamp)
+            try {
+                if ($null -ne $item.PSObject.Properties["tagName"]) {
+                    $tagName = [string]$item.tagName
+                }
+
+                if ([string]::IsNullOrWhiteSpace($tagName)) {
+                    Write-Log -Level "WARN" -Event "context_malformed" -Message "getTagContext returned a context item without tagName."
+                    continue
+                }
+
+                [void]$returnedTags.Add($tagName)
+
+                if ($null -eq $item.PSObject.Properties["tagContext"] -or $null -eq $item.tagContext) {
+                    Add-UnavailableTag -Tag $tagName -Stage "getTagContext" -Error "Context item omitted tagContext"
+                    Write-Log -Level "WARN" -Event "context_unavailable" -Message "Context missing tagContext; will attempt tag individually later: $tagName"
+                    continue
+                }
+
+                $oldestText = [string]$item.tagContext.oldestTimeStamp
+                $latestText = [string]$item.tagContext.latestTimeStamp
+
+                if ([string]::IsNullOrWhiteSpace($oldestText)) {
+                    Add-UnavailableTag -Tag $tagName -Stage "getTagContext" -Error "Context omitted oldestTimeStamp"
+                    Write-Log -Level "WARN" -Event "context_unavailable" -Message "Context missing oldestTimeStamp; will attempt tag individually later: $tagName"
+                    continue
+                }
+
+                if ([string]::IsNullOrWhiteSpace($latestText)) {
+                    Add-UnavailableTag -Tag $tagName -Stage "getTagContext" -Error "Context omitted latestTimeStamp"
+                    Write-Log -Level "WARN" -Event "context_unavailable" -Message "Context missing latestTimeStamp; will attempt tag individually later: $tagName"
+                    continue
+                }
+
+                $oldest = [DateTimeOffset]::Parse($oldestText)
+                $latest = [DateTimeOffset]::Parse($latestText)
+
+                if ($oldest -gt $latest) {
+                    Add-UnavailableTag -Tag $tagName -Stage "getTagContext" -Error "Context oldestTimeStamp is later than latestTimeStamp"
+                    Write-Log -Level "WARN" -Event "context_unavailable" -Message "Context timestamp range is inverted; will attempt tag individually later: $tagName"
+                    continue
+                }
             }
-            if ($item.tagContext.latestTimeStamp) {
-                $latest = [DateTimeOffset]::Parse($item.tagContext.latestTimeStamp)
+            catch {
+                if (-not [string]::IsNullOrWhiteSpace($tagName)) {
+                    Add-UnavailableTag -Tag $tagName -Stage "getTagContext" -Error $_.Exception.Message
+                    Write-Log -Level "WARN" -Event "context_unavailable" -Message "Context malformed; will attempt tag individually later: $tagName"
+                }
+                continue
             }
 
             [PSCustomObject]@{
-                Tag    = [string]$item.tagName
+                Tag    = $tagName
                 Oldest = $oldest
                 Latest = $latest
                 Count  = $null
             }
         }
+
+        foreach ($tag in $Tags) {
+            $tagName = [string]$tag
+            if (-not $returnedTags.Contains($tagName)) {
+                Add-UnavailableTag -Tag $tagName -Stage "getTagContext" -Error "Context response omitted tag"
+                Write-Log -Level "WARN" -Event "context_unavailable" -Message "Context response omitted tag; will attempt tag individually later: $tagName"
+            }
+        }
+
         return
     }
     catch {
         if ($Tags.Count -eq 1) {
             $tag = [string]$Tags[0]
-            [void]$script:UnavailableTags.Add([PSCustomObject]@{
-                Tag = $tag
-                Stage = "getTagContext"
-                Error = $_.Exception.Message
-            })
+            Add-UnavailableTag -Tag $tag -Stage "getTagContext" -Error $_.Exception.Message
             Write-Log -Level "WARN" -Event "context_unavailable" -Message "Context unavailable; will attempt tag individually later: $tag"
             return
         }
@@ -1159,8 +1264,6 @@ function Get-CanaryTagContextResilient {
     Get-CanaryTagContextResilient -Tags $left
     Get-CanaryTagContextResilient -Tags $right
 }
-
-$script:NoCountTags = New-Object System.Collections.ArrayList
 
 function Get-CanaryCountsResilient {
     param(
@@ -1208,7 +1311,7 @@ function Get-CanaryCountsResilient {
                 $body["continuation"] = $continuation
             }
 
-            $result = Invoke-CanaryRequest -Endpoint "getTagData2" -Body $body -Operation "Count aggregate ($tagCount tags, page $page)"
+            $result = Invoke-CanaryRequest -Endpoint "getTagData2" -Body $body -Operation "Count aggregate ($tagCount tags, page $page)" -Attempts 1
 
             if ($null -ne $result.Parsed.data) {
                 foreach ($tag in $Tags) {
@@ -1240,15 +1343,22 @@ function Get-CanaryCountsResilient {
         # Only split batches for errors that can actually be caused by a tag.
         # Systemic/version/request errors must remain one clear error rather
         # than being transformed into thousands of fake bad-tag warnings.
+        if (Test-SystemicCountFailure -Message $errorText) {
+            foreach ($tag in $Tags) {
+                Add-NoCountTag -Tag ([string]$tag) -Reason $errorText
+            }
+            throw "Canary aggregate processing returned NoLicense or another systemic aggregate failure. Count estimation is unavailable. Raw export eligibility is unaffected. $errorText"
+        }
+
         if (-not (Test-TagSpecificFailure -Message $errorText)) {
-            throw "Systemic Count failure. No tags were classified as bad. $errorText"
+            foreach ($tag in $Tags) {
+                Add-NoCountTag -Tag ([string]$tag) -Reason $errorText
+            }
+            throw "Systemic Count failure. Count estimation is unavailable. Raw export eligibility is unaffected. $errorText"
         }
 
         if ($tagCount -eq 1) {
-            [void]$script:NoCountTags.Add([PSCustomObject]@{
-                Tag = [string]$Tags[0]
-                Reason = $errorText
-            })
+            Add-NoCountTag -Tag ([string]$Tags[0]) -Reason $errorText
             Write-Log -Level "WARN" -Event "count_unavailable" -Message "Count unavailable for tag: $($Tags[0])"
             return
         }
@@ -1272,10 +1382,7 @@ function Get-CanaryCountsResilient {
             }
         }
         else {
-            [void]$script:NoCountTags.Add([PSCustomObject]@{
-                Tag = $tagName
-                Reason = "No Count result returned"
-            })
+            Add-NoCountTag -Tag $tagName -Reason "No Count result returned"
         }
     }
 }
@@ -1348,6 +1455,237 @@ function Assert-ResumeCompatibility {
     }
 }
 
+function Add-PlanCount {
+    param(
+        [Parameter(Mandatory = $true)]$Map,
+        [Parameter(Mandatory = $true)][string]$Tag
+    )
+
+    if ($Map.ContainsKey($Tag)) {
+        $Map[$Tag] = [int]$Map[$Tag] + 1
+    }
+    else {
+        $Map[$Tag] = 1
+    }
+}
+
+function New-ExportPlan {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$IncludedTags,
+        [Parameter(Mandatory = $true)][object[]]$Contexts,
+        [Parameter(Mandatory = $true)][object[]]$UnavailableTags,
+        [Parameter(Mandatory = $true)][object[]]$NoCountTags,
+        [Parameter(Mandatory = $true)][object[]]$Batches,
+        [bool]$CountSkipped,
+        [string]$CountSystemicFailure
+    )
+
+    $contextByTag = @{}
+    foreach ($context in $Contexts) {
+        if ($null -eq $context) { continue }
+        $tag = [string]$context.Tag
+        if ([string]::IsNullOrWhiteSpace($tag)) { continue }
+        if (-not $contextByTag.ContainsKey($tag)) {
+            $contextByTag[$tag] = $context
+        }
+    }
+
+    $unavailableByTag = @{}
+    foreach ($item in $UnavailableTags) {
+        if ($null -eq $item) { continue }
+        $tag = [string]$item.Tag
+        if ([string]::IsNullOrWhiteSpace($tag)) { continue }
+        if (-not $unavailableByTag.ContainsKey($tag)) {
+            $unavailableByTag[$tag] = $item
+        }
+    }
+
+    $noCountByTag = @{}
+    foreach ($item in $NoCountTags) {
+        if ($null -eq $item) { continue }
+        $tag = [string]$item.Tag
+        if ([string]::IsNullOrWhiteSpace($tag)) { continue }
+        if (-not $noCountByTag.ContainsKey($tag)) {
+            $noCountByTag[$tag] = $item
+        }
+    }
+
+    $batchIdsByTag = @{}
+    foreach ($batch in $Batches) {
+        foreach ($tagValue in @($batch.Tags)) {
+            $tag = [string]$tagValue
+            if (-not $batchIdsByTag.ContainsKey($tag)) {
+                $batchIdsByTag[$tag] = New-Object System.Collections.ArrayList
+            }
+            [void]$batchIdsByTag[$tag].Add([string]$batch.Id)
+        }
+    }
+
+    foreach ($tagValue in ($IncludedTags | Sort-Object)) {
+        $tag = [string]$tagValue
+        $context = $null
+        $unavailable = $null
+        $noCount = $null
+
+        if ($contextByTag.ContainsKey($tag)) { $context = $contextByTag[$tag] }
+        if ($unavailableByTag.ContainsKey($tag)) { $unavailable = $unavailableByTag[$tag] }
+        if ($noCountByTag.ContainsKey($tag)) { $noCount = $noCountByTag[$tag] }
+
+        $batchIds = @()
+        if ($batchIdsByTag.ContainsKey($tag)) {
+            $batchIds = @($batchIdsByTag[$tag])
+        }
+
+        $planType = "Missing"
+        if ($batchIds.Count -gt 0) {
+            $hasResolved = $false
+            $hasFallback = $false
+            foreach ($batchId in $batchIds) {
+                if ([string]$batchId -like "B*") { $hasResolved = $true }
+                if ([string]$batchId -like "U*") { $hasFallback = $true }
+            }
+
+            if ($hasResolved -and $hasFallback) { $planType = "Duplicate" }
+            elseif ($hasResolved) { $planType = "B" }
+            elseif ($hasFallback) { $planType = "U" }
+        }
+
+        $contextStatus = "Missing"
+        if ($null -ne $context) {
+            $contextStatus = "Resolved"
+        }
+        elseif ($null -ne $unavailable) {
+            $contextStatus = "Unresolved: $($unavailable.Error)"
+        }
+
+        $countValue = $null
+        $countStatus = "Not attempted"
+        if ($null -ne $context) {
+            if ($null -ne $context.Count) {
+                $countValue = $context.Count
+                $countStatus = "Available"
+            }
+            elseif ($CountSkipped) {
+                $countStatus = "Skipped"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($CountSystemicFailure)) {
+                $countStatus = "Unavailable: systemic Count failure"
+            }
+            elseif ($null -ne $noCount) {
+                $countStatus = "Unavailable: $($noCount.Reason)"
+            }
+            else {
+                $countStatus = "Unknown"
+            }
+        }
+
+        [PSCustomObject]@{
+            Tag = $tag
+            PlanType = $planType
+            BatchId = ($batchIds -join ";")
+            ContextStatus = $contextStatus
+            Oldest = $(if ($null -ne $context -and $null -ne $context.Oldest) { $context.Oldest.ToString("o") } else { "" })
+            Latest = $(if ($null -ne $context -and $null -ne $context.Latest) { $context.Latest.ToString("o") } else { "" })
+            Count = $countValue
+            CountStatus = $countStatus
+        }
+    }
+}
+
+function Assert-ExportPlanCoverage {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$IncludedTags,
+        [Parameter(Mandatory = $true)][object[]]$Batches
+    )
+
+    $includedSet = @{}
+    foreach ($tagValue in $IncludedTags) {
+        $includedSet[[string]$tagValue] = $true
+    }
+
+    $plannedCounts = @{}
+    $resolvedSet = @{}
+    $fallbackSet = @{}
+
+    foreach ($batch in $Batches) {
+        foreach ($tagValue in @($batch.Tags)) {
+            $tag = [string]$tagValue
+            Add-PlanCount -Map $plannedCounts -Tag $tag
+
+            if ([string]$batch.Kind -eq "resolved") {
+                $resolvedSet[$tag] = $true
+            }
+            elseif ([string]$batch.Kind -eq "context-fallback") {
+                $fallbackSet[$tag] = $true
+            }
+        }
+    }
+
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($tag in $includedSet.Keys) {
+        if (-not $plannedCounts.ContainsKey($tag)) {
+            [void]$missing.Add($tag)
+        }
+    }
+
+    $duplicate = New-Object System.Collections.ArrayList
+    $extra = New-Object System.Collections.ArrayList
+    foreach ($tag in $plannedCounts.Keys) {
+        if ([int]$plannedCounts[$tag] -ne 1) {
+            [void]$duplicate.Add($tag)
+        }
+        if (-not $includedSet.ContainsKey($tag)) {
+            [void]$extra.Add($tag)
+        }
+    }
+
+    $intersection = New-Object System.Collections.ArrayList
+    foreach ($tag in $resolvedSet.Keys) {
+        if ($fallbackSet.ContainsKey($tag)) {
+            [void]$intersection.Add($tag)
+        }
+    }
+
+    $failureCount = $missing.Count + $duplicate.Count + $extra.Count + $intersection.Count
+    if ($failureCount -gt 0) {
+        $records = New-Object System.Collections.ArrayList
+        foreach ($tag in $missing) { [void]$records.Add([PSCustomObject]@{ Tag = $tag; Problem = "Missing" }) }
+        foreach ($tag in $duplicate) { [void]$records.Add([PSCustomObject]@{ Tag = $tag; Problem = "Duplicate" }) }
+        foreach ($tag in $extra) { [void]$records.Add([PSCustomObject]@{ Tag = $tag; Problem = "Extra" }) }
+        foreach ($tag in $intersection) { [void]$records.Add([PSCustomObject]@{ Tag = $tag; Problem = "ResolvedAndFallback" }) }
+        $records | Sort-Object Problem, Tag | Export-Csv -LiteralPath $ExportPlanFailurePath -NoTypeInformation
+
+        Write-Log -Level "ERROR" -Event "export_plan_validation_failed" -Message (
+            "Export plan validation failed. Included tags: $($includedSet.Count). Resolved tags: $($resolvedSet.Count). Fallback tags: $($fallbackSet.Count). Planned unique tags: $($plannedCounts.Count). Missing tags: $($missing.Count). Duplicate tags: $($duplicate.Count)."
+        ) -Data @{
+            includedTags = $includedSet.Count
+            resolvedTags = $resolvedSet.Count
+            fallbackTags = $fallbackSet.Count
+            plannedUniqueTags = $plannedCounts.Count
+            missingTags = $missing.Count
+            duplicateTags = $duplicate.Count
+            extraTags = $extra.Count
+            resolvedAndFallbackTags = $intersection.Count
+            failurePath = $ExportPlanFailurePath
+        }
+
+        throw "Export plan validation failed. See $ExportPlanFailurePath."
+    }
+
+    if (Test-Path -LiteralPath $ExportPlanFailurePath) {
+        Remove-Item -LiteralPath $ExportPlanFailurePath -Force
+    }
+
+    Write-Log -Level "OK" -Event "export_plan_validated" -Message (
+        "Export plan validated: all $($includedSet.Count.ToString('N0')) included tags are assigned exactly once. Resolved: $($resolvedSet.Count.ToString('N0')). Fallback: $($fallbackSet.Count.ToString('N0'))."
+    ) -Data @{
+        includedTags = $includedSet.Count
+        resolvedTags = $resolvedSet.Count
+        fallbackTags = $fallbackSet.Count
+        plannedUniqueTags = $plannedCounts.Count
+    }
+}
+
 function New-ExportState {
     Write-Log -Level "INFO" -Event "discovery_start" -Message "Phase 1/3: browsing all accessible tags."
 
@@ -1383,7 +1721,7 @@ function New-ExportState {
     }
     while (Test-Continuation $continuation)
 
-    $allTags = @($allTagsList | Sort-Object -Unique)
+    $allTags = @(Get-UniqueStringsOrdinal -Items $allTagsList.ToArray())
     $excluded = @($allTags | Where-Object { $_ -match $ExcludeRegex })
     $included = @($allTags | Where-Object { $_ -notmatch $ExcludeRegex })
 
@@ -1420,20 +1758,30 @@ function New-ExportState {
     }
 
     $validContexts = @($contexts | Where-Object { $null -ne $_.Oldest -and $null -ne $_.Latest })
-    if ($validContexts.Count -eq 0) {
-        throw "No non-diagnostic tags returned valid historical context."
+    $fallbackEndTime = (Get-Date).ToUniversalTime()
+
+    if ($validContexts.Count -gt 0) {
+        $globalOldest = ($validContexts | Sort-Object Oldest | Select-Object -First 1).Oldest
+        $globalLatest = ($validContexts | Sort-Object Latest -Descending | Select-Object -First 1).Latest
+
+        Write-Log -Level "OK" -Event "context_complete" -Message (
+            "Resolved $($validContexts.Count.ToString('N0')) tags. Historical range: $($globalOldest.ToString('o')) through $($globalLatest.ToString('o'))."
+        )
+    }
+    else {
+        $globalOldest = [DateTimeOffset]::Parse($FallbackStartTime)
+        $globalLatest = [DateTimeOffset]$fallbackEndTime
+
+        Write-Log -Level "WARN" -Event "context_none_resolved" -Message (
+            "No included tags returned valid historical context. All included tags will use individual fallback raw export attempts."
+        )
     }
 
-    $globalOldest = ($validContexts | Sort-Object Oldest | Select-Object -First 1).Oldest
-    $globalLatest = ($validContexts | Sort-Object Latest -Descending | Select-Object -First 1).Latest
-
-    Write-Log -Level "OK" -Event "context_complete" -Message (
-        "Resolved $($validContexts.Count.ToString('N0')) tags. Historical range: $($globalOldest.ToString('o')) through $($globalLatest.ToString('o'))."
-    )
-
     $countMap = @{}
+    $countSkipped = [bool]$SkipCount
+    $countSystemicFailure = ""
 
-    if (-not $SkipCount) {
+    if (-not $SkipCount -and $validContexts.Count -gt 0) {
         Write-Log -Level "INFO" -Event "count_start" -Message "Phase 3/3: counting TVQs using explicit $CountBucketDays-day buckets for cross-version compatibility."
         $countChecked = 0
         $contextTags = @($validContexts.Tag)
@@ -1452,16 +1800,21 @@ function New-ExportState {
             }
         }
         catch {
+            $countSystemicFailure = $_.Exception.Message
             # Count is only used for ordering/progress estimation. A systemic Count
             # incompatibility must never prevent the actual raw historian export.
-            Write-Log -Level "ERROR" -Event "count_systemic_failure" -Message (
-                "Count phase could not be completed and will be ignored. Raw export will continue without a TVQ-based ETA. $($_.Exception.Message)"
+            Write-Log -Level "WARN" -Event "count_systemic_failure" -Message (
+                "Canary aggregate processing returned a systemic Count failure. Count estimation is unavailable. Raw export eligibility is unaffected; continuing with all planned tags. $($_.Exception.Message)"
             )
             $countMap = @{}
         }
     }
-    else {
+    elseif ($SkipCount) {
         Write-Log -Level "WARN" -Event "count_skipped" -Message "Count phase skipped. Percentage and ETA will be based on completed batches rather than TVQs."
+    }
+    else {
+        $countSkipped = $true
+        Write-Log -Level "WARN" -Event "count_skipped_no_context" -Message "Count phase skipped because no tags resolved historical context. Raw fallback export will continue."
     }
 
     foreach ($context in $contexts) {
@@ -1473,6 +1826,27 @@ function New-ExportState {
     @($contexts) | Sort-Object Tag | Export-Csv -LiteralPath $InventoryPath -NoTypeInformation
     @($script:UnavailableTags) | Export-Csv -LiteralPath $UnavailablePath -NoTypeInformation
     @($script:NoCountTags) | Export-Csv -LiteralPath $NoCountPath -NoTypeInformation
+
+    $resolvedTagSet = @{}
+    foreach ($context in $validContexts) {
+        $resolvedTagSet[[string]$context.Tag] = $true
+    }
+
+    $unavailableTagSet = @{}
+    foreach ($item in @($script:UnavailableTags)) {
+        if ($null -ne $item -and -not [string]::IsNullOrWhiteSpace([string]$item.Tag)) {
+            $unavailableTagSet[[string]$item.Tag] = $true
+        }
+    }
+
+    foreach ($tagValue in $included) {
+        $tag = [string]$tagValue
+        if (-not $resolvedTagSet.ContainsKey($tag) -and -not $unavailableTagSet.ContainsKey($tag)) {
+            Add-UnavailableTag -Tag $tag -Stage "exportPlanning" -Error "Included tag had no resolved context or fallback record"
+            $unavailableTagSet[$tag] = $true
+            Write-Log -Level "WARN" -Event "context_unavailable" -Message "Included tag had no resolved context or fallback record; will attempt tag individually later: $tag"
+        }
+    }
 
     # Sort high-volume tags first when counts are known. This gives full pages early
     # and makes the live throughput estimate settle quickly.
@@ -1503,10 +1877,11 @@ function New-ExportState {
         })
     }
 
+    @($script:UnavailableTags) | Export-Csv -LiteralPath $UnavailablePath -NoTypeInformation
+
     # Attempt context-rejected non-diagnostic tags individually across a broad fallback interval.
-    # Permanent access/not-found failures are
-    # logged and preserved in state without blocking the rest of the export.
-    $unresolvedUnique = @($script:UnavailableTags | Select-Object -ExpandProperty Tag -Unique)
+    # Permanent access/not-found failures are logged and preserved in state.
+    $unresolvedUnique = @(Get-UniqueStringsOrdinal -Items @($script:UnavailableTags | Select-Object -ExpandProperty Tag))
     foreach ($tag in $unresolvedUnique) {
         $batchId++
         [void]$batches.Add([PSCustomObject]@{
@@ -1514,7 +1889,7 @@ function New-ExportState {
             Kind = "context-fallback"
             Tags = @([string]$tag)
             StartTime = $FallbackStartTime
-            EndTime = (Get-Date).ToUniversalTime().ToString("o")
+            EndTime = $fallbackEndTime.ToString("o")
             Status = "Pending"
             NextPage = 1
             Continuation = $null
@@ -1524,6 +1899,19 @@ function New-ExportState {
             LastError = $null
         })
     }
+
+    Assert-ExportPlanCoverage -IncludedTags $included -Batches @($batches)
+    $exportPlan = @(
+        New-ExportPlan `
+            -IncludedTags $included `
+            -Contexts @($contexts) `
+            -UnavailableTags @($script:UnavailableTags) `
+            -NoCountTags @($script:NoCountTags) `
+            -Batches @($batches) `
+            -CountSkipped $countSkipped `
+            -CountSystemicFailure $countSystemicFailure
+    )
+    $exportPlan | Export-Csv -LiteralPath $ExportPlanPath -NoTypeInformation
 
     $expectedPoints = 0.0
     foreach ($context in $contexts) {
@@ -1550,6 +1938,7 @@ function New-ExportState {
         HistoricalStart = $globalOldest.ToString("o")
         HistoricalEnd = $globalLatest.ToString("o")
         ExpectedPoints = $expectedPoints
+        ExportPlan = "export-plan.csv"
         Batches = @($batches)
     }
 
@@ -1857,6 +2246,7 @@ function Write-FinalSummary {
         historicalEnd = $State.HistoricalEnd
         dataFormat = $(if ($OutputCompression -eq "None") { "raw Canary getTagData2 JSON responses (.json)" } else { "gzip-compressed raw Canary getTagData2 JSON responses (.json.gz)" })
         stateFile = "state.json"
+        exportPlan = "export-plan.csv"
         pageManifest = "pages.jsonl"
     }
 

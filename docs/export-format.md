@@ -37,6 +37,10 @@ Durable resume state. It records the export configuration and per-batch progress
 
 Append-only audit metadata for committed pages. Use it to review counts, sizes, and timing without opening every JSON page.
 
+### `export-plan.csv`
+
+Per-tag export assignment written before raw extraction starts. Each included tag appears once with `PlanType`, `BatchId`, context status, timestamps, Count value, and Count status.
+
 ### `tag-inventory.csv`
 
 The resolved tag inventory with context/count information used by the exporter.
@@ -58,3 +62,5 @@ Some Canary errors are permanent. For example, `TagKey contains no TrendVectors`
 ## Count is advisory
 
 The Count phase exists for progress and ETA estimates. Raw extraction correctness comes from `getTagData2` pages and checkpoints. If Count fails systemically, the exporter can continue with raw history requests.
+
+Aggregate errors such as `GetAggregateDataAsync` with `NoLicense` disable Count estimation only. They do not remove tags from `export-plan.csv` or raw export batches.

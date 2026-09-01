@@ -133,6 +133,7 @@ A typical export looks like this:
 CanaryExport/
   state.json
   pages.jsonl
+  export-plan.csv
   tag-inventory.csv
   excluded-tags.csv
   unavailable-tags.csv
@@ -148,7 +149,7 @@ CanaryExport/
       page-000001.json
 ```
 
-`Bxxxxx` directories are normal resolved multi-tag batches. `Uxxxxx` directories are single-tag fallback batches for tags whose historical context failed normal resolution. A `page-xxxxxx` file is one `getTagData2` response; later pages use Canary continuation tokens.
+`Bxxxxx` directories are normal resolved multi-tag batches. `Uxxxxx` directories are single-tag fallback batches for tags whose historical context failed normal resolution. `export-plan.csv` records each included tag's resolved or fallback batch assignment before raw extraction starts. A `page-xxxxxx` file is one `getTagData2` response; later pages use Canary continuation tokens.
 
 See [Export format and recovery](docs/export-format.md) for the complete model.
 
@@ -156,7 +157,7 @@ See [Export format and recovery](docs/export-format.md) for the complete model.
 
 Run the same command against the same output directory. `state.json` stores batch status, page number, and continuation state. Finalized page files are checked before resume, and incomplete temporary files are ignored.
 
-Permanent tag failures such as `TagKey contains no TrendVectors` / `0x800403F8` are classified as unavailable. The exporter skips the full exponential-backoff schedule for those conditions.
+Permanent raw tag failures such as `TagKey contains no TrendVectors` / `0x800403F8` are classified as unavailable after a raw history request returns that condition. Aggregate Count failures only disable Count-based estimates.
 
 ## Canary version notes
 
