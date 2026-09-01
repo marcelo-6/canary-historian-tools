@@ -9,14 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### <!-- 0 -->Features
-- Add parallel Canary batch export with runspace pool  ([5c9a000](https://github.com/marcelo-6/canary-historian-tools/commit/5c9a000041b94d929c1dcccdfb20bb18aded4ab2))
+- Add parallel json to csv conversion  ([526255b](https://github.com/marcelo-6/canary-historian-tools/commit/526255bc00240d2ef9e707b082a2fa8313dbf587))
+
+
+## [0.1.5] - 2026-09-01
+
+### <!-- 0 -->Features
+- Add parallel Canary batch export with runspace pool  by @marcelo-6 ([5c9a000](https://github.com/marcelo-6/canary-historian-tools/commit/5c9a000041b94d929c1dcccdfb20bb18aded4ab2))
 
 
 ### <!-- 3 -->Documentation
-- Explain export concepts and recommended settings  ([f044496](https://github.com/marcelo-6/canary-historian-tools/commit/f0444962cd114a519cb101fe1ddac4024e0e431d))
+- Explain export concepts and recommended settings  by @marcelo-6 ([f044496](https://github.com/marcelo-6/canary-historian-tools/commit/f0444962cd114a519cb101fe1ddac4024e0e431d))
 
 
 ### <!-- 7 -->Miscellaneous Tasks
+- Prepare release  by @marcelo-6 ([de0c80d](https://github.com/marcelo-6/canary-historian-tools/commit/de0c80d4c2fa9bc9590fa62eb0074f5bd041dc9e))
+
 - Sync changelog with commits  by @marcelo-6 ([485a8f6](https://github.com/marcelo-6/canary-historian-tools/commit/485a8f63f60c4bb8aaeee17b5fdf04a98bbddc46))
 
 
