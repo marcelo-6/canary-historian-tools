@@ -6,16 +6,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.4] - 2026-09-01
+
+### <!-- 7 -->Miscellaneous Tasks
+- Publish release scripts without zip packaging  by @marcelo-6 ([0e2fdf1](https://github.com/marcelo-6/canary-historian-tools/commit/0e2fdf11b0321f714ec7e743c908c4e9e86bd067))
+
+
+## [0.1.3] - 2026-09-01
+
+### <!-- 1 -->Bug Fixes
+- Prevent bulk exports from failing during pagination  by @marcelo-6 ([ede6dd5](https://github.com/marcelo-6/canary-historian-tools/commit/ede6dd5d44450d7d42cbc9bbe6415ffa8f7aa71c))
+
+- Removed zips from releases  by @marcelo-6 ([af9fffe](https://github.com/marcelo-6/canary-historian-tools/commit/af9fffeb269cc80929463c38bd55915c0442a08c))
+
+
+## [0.1.2] - 2026-09-01
+
+### <!-- 1 -->Bug Fixes
+- Keep Canary exports from silently dropping tags  by @marcelo-6 ([29eeb55](https://github.com/marcelo-6/canary-historian-tools/commit/29eeb558531de57342a93df1543d4d931dbe8299))
+
+- Validate raw export plan coverage  by @marcelo-6 ([658059e](https://github.com/marcelo-6/canary-historian-tools/commit/658059e606fc88bf5d368ceb1a18db131b08ba81))
+
+
+## [0.1.1] - 2026-08-31
 
 ### <!-- 3 -->Documentation
-- Align documentation style  ([bd34f4c](https://github.com/marcelo-6/canary-historian-tools/commit/bd34f4cb5ed27be933a528f677251def596091de))
+- Align documentation style  by @marcelo-6 ([bd34f4c](https://github.com/marcelo-6/canary-historian-tools/commit/bd34f4cb5ed27be933a528f677251def596091de))
 
 
 ### <!-- 7 -->Miscellaneous Tasks
-- Update git-cliff changelog format  ([3c4ee34](https://github.com/marcelo-6/canary-historian-tools/commit/3c4ee342c0e00d32ff8355d8cf4a9a580c639de7))
+- Prepare release  by @marcelo-6 ([32edbb2](https://github.com/marcelo-6/canary-historian-tools/commit/32edbb27488d912fbfb589408f915e2f622d0ef5))
 
-- Publish PowerShell scripts as release assets  ([19758f8](https://github.com/marcelo-6/canary-historian-tools/commit/19758f8d3ca5f6fd22ba9fffb8b16f47f2982a78))
+- Update git-cliff changelog format  by @marcelo-6 ([3c4ee34](https://github.com/marcelo-6/canary-historian-tools/commit/3c4ee342c0e00d32ff8355d8cf4a9a580c639de7))
+
+- Publish PowerShell scripts as release assets  by @marcelo-6 ([19758f8](https://github.com/marcelo-6/canary-historian-tools/commit/19758f8d3ca5f6fd22ba9fffb8b16f47f2982a78))
 
 
 ## [0.1.0] - 2026-08-31
