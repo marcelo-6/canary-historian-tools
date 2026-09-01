@@ -156,6 +156,19 @@
     -CompressionLevel controls GZIP and ZIP compression and accepts Fastest or Optimal.
     Fastest is useful when conversion throughput matters more than squeezing the final archive size.
 
+    PARALLEL CONVERSION
+    ===================
+    -Parallelism controls how many independent source pages may be converted concurrently. The default
+    is 4. Page conversion uses a runspace pool and keeps all shared manifest/log/summary writes on the
+    coordinator thread. Each worker owns only its source page and unique output file.
+
+    Parallel conversion is enabled only for the compiled streaming parsers. If the converter falls back
+    to PowerShell ConvertFrom-Json, effective parallelism is forced to 1 to avoid multiplying the large
+    object-graph memory cost across workers.
+
+    None, Gzip, Zip/PerFile, and SingleArchive staging can all convert pages concurrently. The final
+    SingleArchive ZIP build remains serial after every required staging page is checkpointed.
+
     SINGLE-INSTANCE SAFETY
     ======================
     A converter.lock file is held open exclusively for the selected OutputDirectory. A second
@@ -197,6 +210,14 @@
     .\Convert-CanaryJsonToCsv.ps1 `
         -ExportDirectory ".\CanaryFullExport" `
         -Compression None
+
+.EXAMPLE
+    # Parallel streaming conversion using four workers
+    .\Convert-CanaryJsonToCsv.ps1 `
+        -ExportDirectory ".\CanaryFullExport" `
+        -Compression Gzip `
+        -CompressionLevel Fastest `
+        -Parallelism 4
 
 .NOTES
     Designed for Windows PowerShell 5.1 and PowerShell 7+.
@@ -260,7 +281,12 @@ param(
     # Number of successfully converted pages between explicit garbage collections.
     # Mainly relevant to the PowerShell parser fallback. 0 disables explicit GC.
     [ValidateRange(0, 10000)]
-    [int]$GcEveryPages = 10
+    [int]$GcEveryPages = 10,
+
+    # Independent source pages may be converted concurrently when a compiled streaming parser is active.
+    # Parallelism=1 preserves the original serial conversion path.
+    [ValidateRange(1, 32)]
+    [int]$Parallelism = 4
 )
 
 Set-StrictMode -Version Latest
@@ -328,6 +354,7 @@ $script:StreamingConverterAvailable = $false
 $script:ConverterMode = "PowerShell"
 $script:SingleArchiveBuiltThisRun = $false
 $script:SingleArchiveBytes = 0L
+$script:EffectiveParallelism = $Parallelism
 
 # ============================================================
 # Console and structured logging
@@ -1556,6 +1583,525 @@ function Convert-OnePage {
 }
 
 # ============================================================
+# Parallel page conversion
+# ============================================================
+
+# Each worker owns exactly one source page at a time. It may read/decompress the
+# source, stream JSON -> CSV, package the output, and atomically publish that
+# page. Workers never append to the shared conversion manifest, summary, or logs.
+# Those durable/shared writes remain coordinator-only.
+$script:ParallelPageWorkerScript = @'
+param(
+    [string]$SourcePath,
+    [string]$SourceName,
+    [string]$SourceRelative,
+    [string]$OutputPath,
+    [string]$ConverterTypeName,
+    [string]$PagePackagingMode,
+    [string]$CompressionLevelName,
+    [int]$MaxAttempts,
+    [int]$RetryBaseSeconds
+)
+
+$ErrorActionPreference = "Stop"
+
+function Find-ConverterType {
+    param([string]$Name)
+
+    foreach ($assembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        $type = $assembly.GetType($Name, $false, $false)
+        if ($null -ne $type) { return $type }
+    }
+
+    return $null
+}
+
+function Publish-TemporaryFile {
+    param(
+        [string]$TemporaryPath,
+        [string]$DestinationPath
+    )
+
+    if (Test-Path -LiteralPath $DestinationPath) {
+        try {
+            [System.IO.File]::Replace($TemporaryPath, $DestinationPath, $null)
+            return
+        }
+        catch {
+            Remove-Item -LiteralPath $DestinationPath -Force
+        }
+    }
+
+    [System.IO.File]::Move($TemporaryPath, $DestinationPath)
+}
+
+$outputDirectoryForPage = Split-Path -Parent $OutputPath
+New-Item -ItemType Directory -Path $outputDirectoryForPage -Force | Out-Null
+
+$tempPath = "{0}.tmp.{1}.{2}" -f $OutputPath, $PID, ([Guid]::NewGuid().ToString("N"))
+$compressionLevel = [System.Enum]::Parse(
+    [System.IO.Compression.CompressionLevel],
+    $CompressionLevelName,
+    $true
+)
+
+$converterType = Find-ConverterType -Name $ConverterTypeName
+if ($null -eq $converterType) {
+    throw "Compiled converter type '$ConverterTypeName' is not available in this runspace."
+}
+
+$convertMethod = $converterType.GetMethod("Convert", [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static)
+if ($null -eq $convertMethod) {
+    throw "Compiled converter type '$ConverterTypeName' does not expose the expected static Convert method."
+}
+
+$lastFailure = $null
+
+for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $inputFileStream = $null
+    $inputGzipStream = $null
+    $inputPayloadStream = $null
+    $outputFileStream = $null
+    $outputPayloadStream = $null
+    $zipArchive = $null
+    $zipEntryStream = $null
+
+    try {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force
+        }
+
+        $inputFileStream = [System.IO.File]::Open(
+            $SourcePath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+
+        $inputPayloadStream = $inputFileStream
+        if ($SourceName.EndsWith(".json.gz", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $inputGzipStream = [System.IO.Compression.GZipStream]::new(
+                $inputFileStream,
+                [System.IO.Compression.CompressionMode]::Decompress,
+                $true
+            )
+            $inputPayloadStream = $inputGzipStream
+        }
+
+        $outputFileStream = [System.IO.File]::Open(
+            $tempPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+
+        switch ($PagePackagingMode) {
+            "Gzip" {
+                $outputPayloadStream = [System.IO.Compression.GZipStream]::new(
+                    $outputFileStream,
+                    $compressionLevel,
+                    $true
+                )
+            }
+            "ZipPerFile" {
+                $zipArchive = [System.IO.Compression.ZipArchive]::new(
+                    $outputFileStream,
+                    [System.IO.Compression.ZipArchiveMode]::Create,
+                    $true
+                )
+                $entryName = [System.IO.Path]::GetFileNameWithoutExtension($OutputPath)
+                $zipEntry = $zipArchive.CreateEntry($entryName, $compressionLevel)
+                $zipEntryStream = $zipEntry.Open()
+                $outputPayloadStream = $zipEntryStream
+            }
+            default {
+                $outputPayloadStream = $outputFileStream
+            }
+        }
+
+        [object[]]$invokeArguments = @($inputPayloadStream, $outputPayloadStream, [char]',')
+        $stats = $convertMethod.Invoke($null, $invokeArguments)
+
+        # Finalize wrappers before publishing the page.
+        if ($PagePackagingMode -eq "Gzip" -and $null -ne $outputPayloadStream) {
+            $outputPayloadStream.Dispose()
+            $outputPayloadStream = $null
+        }
+        elseif ($PagePackagingMode -eq "ZipPerFile") {
+            if ($null -ne $zipEntryStream) {
+                $zipEntryStream.Dispose()
+                $zipEntryStream = $null
+                $outputPayloadStream = $null
+            }
+            if ($null -ne $zipArchive) {
+                $zipArchive.Dispose()
+                $zipArchive = $null
+            }
+        }
+
+        if ($null -ne $outputFileStream) {
+            $outputFileStream.Flush()
+            $outputFileStream.Dispose()
+            $outputFileStream = $null
+        }
+
+        if ($null -ne $inputGzipStream) {
+            $inputGzipStream.Dispose()
+            $inputGzipStream = $null
+        }
+        if ($null -ne $inputFileStream) {
+            $inputFileStream.Dispose()
+            $inputFileStream = $null
+        }
+
+        Publish-TemporaryFile -TemporaryPath $tempPath -DestinationPath $OutputPath
+        $sw.Stop()
+
+        $outputInfo = Get-Item -LiteralPath $OutputPath
+
+        [PSCustomObject]@{
+            Success = $true
+            SourceRelative = $SourceRelative
+            Rows = [long]$stats.Rows
+            Tags = [int]$stats.Tags
+            Seconds = $sw.Elapsed.TotalSeconds
+            OutputBytes = [long]$outputInfo.Length
+            Attempt = $attempt
+            LastRetryError = $lastFailure
+            Error = $null
+        }
+        return
+    }
+    catch {
+        if ($sw.IsRunning) { $sw.Stop() }
+
+        $exception = $_.Exception
+        if ($exception -is [System.Reflection.TargetInvocationException] -and $null -ne $exception.InnerException) {
+            $lastFailure = $exception.InnerException.Message
+        }
+        else {
+            $lastFailure = $exception.Message
+        }
+
+        if ($null -ne $zipEntryStream) { try { $zipEntryStream.Dispose() } catch {} }
+        if ($null -ne $zipArchive) { try { $zipArchive.Dispose() } catch {} }
+        if ($PagePackagingMode -eq "Gzip" -and $null -ne $outputPayloadStream) {
+            try { $outputPayloadStream.Dispose() } catch {}
+        }
+        if ($null -ne $outputFileStream) { try { $outputFileStream.Dispose() } catch {} }
+        if ($null -ne $inputGzipStream) { try { $inputGzipStream.Dispose() } catch {} }
+        if ($null -ne $inputFileStream) { try { $inputFileStream.Dispose() } catch {} }
+
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            $jitterMs = Get-Random -Minimum 0 -Maximum 1000
+            $delay = [Math]::Min(
+                60.0,
+                ($RetryBaseSeconds * [Math]::Pow(2, $attempt - 1)) + ($jitterMs / 1000.0)
+            )
+            Start-Sleep -Milliseconds ([int]($delay * 1000))
+            continue
+        }
+
+        [PSCustomObject]@{
+            Success = $false
+            SourceRelative = $SourceRelative
+            Rows = 0L
+            Tags = 0
+            Seconds = $sw.Elapsed.TotalSeconds
+            OutputBytes = 0L
+            Attempt = $attempt
+            LastRetryError = $lastFailure
+            Error = $lastFailure
+        }
+        return
+    }
+}
+'@
+
+function Assert-ParallelCandidateOutputPaths {
+    param([Parameter(Mandatory = $true)][object[]]$Candidates)
+
+    $byOutput = @{}
+
+    foreach ($candidate in @($Candidates)) {
+        $outputPath = [string]$candidate.OutputPath
+        if (-not $byOutput.ContainsKey($outputPath)) {
+            $byOutput[$outputPath] = New-Object System.Collections.ArrayList
+        }
+        [void]$byOutput[$outputPath].Add([string]$candidate.SourceRelative)
+    }
+
+    $collisions = @(
+        foreach ($entry in $byOutput.GetEnumerator()) {
+            if ($entry.Value.Count -gt 1) {
+                [PSCustomObject]@{
+                    OutputPath = $entry.Key
+                    Sources = ($entry.Value -join '; ')
+                }
+            }
+        }
+    )
+
+    if ($collisions.Count -gt 0) {
+        $first = $collisions[0]
+        throw "Parallel conversion found multiple source pages that map to the same output path. Example: $($first.Sources) -> $($first.OutputPath). Resolve duplicate .json/.json.gz page identities before parallel conversion."
+    }
+}
+
+function Start-ParallelPageTask {
+    param(
+        [Parameter(Mandatory = $true)]$Pool,
+        [Parameter(Mandatory = $true)]$WorkItem,
+        [Parameter(Mandatory = $true)][string]$ConverterTypeName,
+        [Parameter(Mandatory = $true)][string]$PagePackagingMode
+    )
+
+    Write-Log -Level "INFO" -Event "page_start" -Message (
+        "Converting $($WorkItem.SourceRelative) ($((Format-Bytes -Bytes $WorkItem.SourceLength))) using $script:ConverterMode [parallel]."
+    ) -Data @{
+        source = $WorkItem.SourceRelative
+        sourceBytes = [long]$WorkItem.SourceLength
+        parser = $script:ConverterMode
+        compression = $Compression
+        zipLayout = $ZipLayout
+        compressionLevel = $CompressionLevel
+        parallelism = $script:EffectiveParallelism
+    }
+
+    $powershell = [System.Management.Automation.PowerShell]::Create()
+    $powershell.RunspacePool = $Pool
+
+    [void]$powershell.AddScript($script:ParallelPageWorkerScript)
+    [void]$powershell.AddArgument([string]$WorkItem.SourcePath)
+    [void]$powershell.AddArgument([string]$WorkItem.SourceName)
+    [void]$powershell.AddArgument([string]$WorkItem.SourceRelative)
+    [void]$powershell.AddArgument([string]$WorkItem.OutputPath)
+    [void]$powershell.AddArgument($ConverterTypeName)
+    [void]$powershell.AddArgument($PagePackagingMode)
+    [void]$powershell.AddArgument($CompressionLevel)
+    [void]$powershell.AddArgument([int]$MaxAttempts)
+    [void]$powershell.AddArgument([int]$RetryBaseSeconds)
+
+    $handle = $powershell.BeginInvoke()
+
+    return [PSCustomObject]@{
+        PowerShell = $powershell
+        Handle = $handle
+        WorkItem = $WorkItem
+    }
+}
+
+function Commit-ParallelPageResult {
+    param(
+        [Parameter(Mandatory = $true)]$WorkItem,
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][hashtable]$ManifestIndex,
+        [int]$ActiveWorkers = 0
+    )
+
+    if (-not [bool]$Result.Success) {
+        $script:FailedThisRun++
+        Write-Log -Level "ERROR" -Event "page_failed" -Message (
+            "Failed to convert $($WorkItem.SourceRelative) after $($Result.Attempt) attempt(s). It was not checkpointed and will be retried on the next run/scan. $($Result.Error)"
+        ) -Data @{
+            source = $WorkItem.SourceRelative
+            attempts = [int]$Result.Attempt
+            error = [string]$Result.Error
+            parallelism = $script:EffectiveParallelism
+        }
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $WorkItem.OutputPath -PathType Leaf)) {
+        $script:FailedThisRun++
+        Write-Log -Level "ERROR" -Event "page_publish_missing" -Message (
+            "Worker reported success for $($WorkItem.SourceRelative), but the finalized output file is missing. The page was not checkpointed."
+        )
+        return $false
+    }
+
+    $outputInfo = Get-Item -LiteralPath $WorkItem.OutputPath
+    if ($outputInfo.Length -le 0) {
+        $script:FailedThisRun++
+        Write-Log -Level "ERROR" -Event "page_publish_empty" -Message (
+            "Worker reported success for $($WorkItem.SourceRelative), but the finalized output file is empty. The page was not checkpointed."
+        )
+        return $false
+    }
+
+    $outputRelative = $outputInfo.FullName.Substring($OutputDirectory.TrimEnd('\', '/').Length).TrimStart('\', '/').Replace('/', '\')
+
+    $record = [ordered]@{
+        timestampUtc = (Get-Date).ToUniversalTime().ToString("o")
+        sourceRelative = $WorkItem.SourceRelative
+        sourceLength = [long]$WorkItem.SourceLength
+        sourceLastWriteTimeUtcTicks = [long]$WorkItem.SourceLastWriteTimeUtcTicks
+        outputRelative = $outputRelative
+        outputLength = [long]$outputInfo.Length
+        rows = [long]$Result.Rows
+        tags = [int]$Result.Tags
+        seconds = [double]$Result.Seconds
+        attempt = [int]$Result.Attempt
+        compression = $Compression
+        zipLayout = $ZipLayout
+        compressionLevel = $CompressionLevel
+        parser = $script:ConverterMode
+    }
+
+    # Coordinator-only durable checkpoint. The worker has already atomically
+    # published the complete page before this record is appended.
+    Append-ManifestRecord -Record $record
+    $ManifestIndex[$WorkItem.SourceRelative] = [PSCustomObject]$record
+
+    $script:ConvertedThisRun++
+    $script:RowsThisRun += [long]$Result.Rows
+    $script:InputBytesThisRun += [long]$WorkItem.SourceLength
+    $script:OutputBytesThisRun += [long]$Result.OutputBytes
+
+    if ([int]$Result.Attempt -gt 1) {
+        Write-Log -Level "RETRY" -Event "page_retry_recovered" -Message (
+            "$($WorkItem.SourceRelative) completed after $($Result.Attempt) attempts. Last retry error: $($Result.LastRetryError)"
+        ) -Data @{
+            source = $WorkItem.SourceRelative
+            attempts = [int]$Result.Attempt
+            lastRetryError = [string]$Result.LastRetryError
+        }
+    }
+
+    $workerRate = 0.0
+    if ([double]$Result.Seconds -gt 0) {
+        $workerRate = [double]$Result.Rows / [double]$Result.Seconds
+    }
+
+    $runtimeSeconds = [Math]::Max(0.001, $script:RunStopwatch.Elapsed.TotalSeconds)
+    $aggregateRate = [double]$script:RowsThisRun / $runtimeSeconds
+
+    Write-Log -Level "DATA" -Event "page_complete" -Message (
+        "$($WorkItem.SourceRelative) -> $outputRelative | $(([long]$Result.Rows).ToString('N0')) rows | $($Result.Tags) tags | $((Format-Bytes -Bytes $WorkItem.SourceLength)) in -> $((Format-Bytes -Bytes $Result.OutputBytes)) out | $([Math]::Round([double]$Result.Seconds, 2))s | $([Math]::Round($workerRate, 0).ToString('N0')) rows/s worker | $([Math]::Round($aggregateRate, 0).ToString('N0')) rows/s aggregate | active $ActiveWorkers/$script:EffectiveParallelism"
+    ) -Data @{
+        source = $WorkItem.SourceRelative
+        output = $outputRelative
+        rows = [long]$Result.Rows
+        tags = [int]$Result.Tags
+        inputBytes = [long]$WorkItem.SourceLength
+        outputBytes = [long]$Result.OutputBytes
+        seconds = [double]$Result.Seconds
+        rowsPerSecond = [double]$workerRate
+        aggregateRowsPerSecond = [double]$aggregateRate
+        attempt = [int]$Result.Attempt
+        activeWorkers = [int]$ActiveWorkers
+        parallelism = [int]$script:EffectiveParallelism
+    }
+
+    return $true
+}
+
+function Invoke-ParallelPageConversions {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Candidates,
+        [Parameter(Mandatory = $true)][hashtable]$ManifestIndex
+    )
+
+    if (@($Candidates).Count -eq 0) {
+        return [PSCustomObject]@{ Converted = 0; Failed = 0 }
+    }
+
+    Assert-ParallelCandidateOutputPaths -Candidates @($Candidates)
+
+    $converterTypeName = switch ($script:ConverterMode) {
+        "StreamingJsonNet" { "CanaryCsvStreamingConverter" }
+        "StreamingBuiltInDotNet" { "CanaryCsvBuiltInStreamingConverter" }
+        default { throw "Parallel conversion requires a compiled streaming parser. Current parser: $script:ConverterMode" }
+    }
+
+    $pagePackagingMode = Get-PagePackagingMode
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $script:EffectiveParallelism)
+    $active = New-Object System.Collections.ArrayList
+    $nextIndex = 0
+    $converted = 0
+    $failed = 0
+
+    try {
+        $pool.Open()
+
+        while ($nextIndex -lt @($Candidates).Count -or $active.Count -gt 0) {
+            while ($nextIndex -lt @($Candidates).Count -and $active.Count -lt $script:EffectiveParallelism) {
+                $workItem = $Candidates[$nextIndex]
+                $nextIndex++
+                $task = Start-ParallelPageTask -Pool $pool -WorkItem $workItem -ConverterTypeName $converterTypeName -PagePackagingMode $pagePackagingMode
+                [void]$active.Add($task)
+            }
+
+            $completedTasks = @($active | Where-Object { $_.Handle.IsCompleted })
+            if ($completedTasks.Count -eq 0) {
+                Start-Sleep -Milliseconds 50
+                continue
+            }
+
+            foreach ($task in $completedTasks) {
+                $activeAtCompletion = $active.Count
+                $result = $null
+
+                try {
+                    $workerOutput = @($task.PowerShell.EndInvoke($task.Handle))
+                    if ($workerOutput.Count -gt 0) {
+                        $result = $workerOutput[$workerOutput.Count - 1]
+                    }
+                    if ($null -eq $result) {
+                        throw "Parallel worker returned no conversion result."
+                    }
+                }
+                catch {
+                    $result = [PSCustomObject]@{
+                        Success = $false
+                        Rows = 0L
+                        Tags = 0
+                        Seconds = 0.0
+                        OutputBytes = 0L
+                        Attempt = 1
+                        LastRetryError = $_.Exception.Message
+                        Error = "Parallel worker failed: $($_.Exception.Message)"
+                    }
+                }
+                finally {
+                    try { $task.PowerShell.Dispose() } catch {}
+                    [void]$active.Remove($task)
+                }
+
+                if (Commit-ParallelPageResult -WorkItem $task.WorkItem -Result $result -ManifestIndex $ManifestIndex -ActiveWorkers $activeAtCompletion) {
+                    $converted++
+                }
+                else {
+                    $failed++
+                }
+            }
+        }
+    }
+    finally {
+        foreach ($task in @($active)) {
+            try { $task.PowerShell.Stop() } catch {}
+            try { $task.PowerShell.Dispose() } catch {}
+        }
+        $active.Clear()
+
+        if ($null -ne $pool) {
+            try { $pool.Close() } catch {}
+            try { $pool.Dispose() } catch {}
+        }
+    }
+
+    return [PSCustomObject]@{
+        Converted = $converted
+        Failed = $failed
+    }
+}
+
+# ============================================================
 # Single ZIP archive finalization
 # ============================================================
 
@@ -1784,6 +2330,8 @@ function Write-SummaryFile {
         zipLayout = $ZipLayout
         compressionLevel = $CompressionLevel
         converterMode = $script:ConverterMode
+        requestedParallelism = [int]$Parallelism
+        effectiveParallelism = [int]$script:EffectiveParallelism
         watchMode = [bool]$Watch
         discoveredSourcePages = $DiscoveredPages
         manifestPages = $ManifestPages
@@ -1838,10 +2386,35 @@ try {
         Write-Host (" Staging data:      {0}" -f $SingleZipStagingDataDirectory) -ForegroundColor DarkGray
     }
     Write-Host (" Watch mode:        {0}" -f [bool]$Watch) -ForegroundColor Gray
+    Write-Host (" Parallelism:       {0}" -f $Parallelism) -ForegroundColor Gray
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
 
     Initialize-StreamingConverter
+
+    if ($script:ConverterMode -eq "PowerShell" -and $Parallelism -gt 1) {
+        $script:EffectiveParallelism = 1
+        Write-Log -Level "WARN" -Event "parallelism_disabled_for_powershell_parser" -Message (
+            "Parallelism=$Parallelism was requested, but the ConvertFrom-Json fallback materializes entire pages in memory. Effective parallelism is forced to 1 for safety."
+        )
+    }
+    else {
+        $script:EffectiveParallelism = $Parallelism
+    }
+
+    Write-Log -Level "OK" -Event "parallelism_ready" -Message (
+        "Page conversion parallelism: requested $Parallelism, effective $script:EffectiveParallelism. Parser: $script:ConverterMode."
+    ) -Data @{
+        requestedParallelism = [int]$Parallelism
+        effectiveParallelism = [int]$script:EffectiveParallelism
+        parser = $script:ConverterMode
+    }
+
+    if ($script:EffectiveParallelism -gt 1 -and $GcEveryPages -gt 0) {
+        Write-Log -Level "INFO" -Event "parallel_gc_policy" -Message (
+            "Explicit per-page GC is disabled while compiled streaming conversions run in parallel; GC remains automatic and the configured GcEveryPages value applies only to the serial path."
+        )
+    }
 
     $manifestIndex = Load-ManifestIndex
     Write-Log -Level "INFO" -Event "manifest_loaded" -Message (
@@ -1861,6 +2434,8 @@ try {
             "Scan $scanNumber found $($sourcePages.Count.ToString('N0')) finalized exporter page(s); $(@($manifestIndex.Keys).Count.ToString('N0')) page(s) are checkpointed."
         )
 
+        $candidates = New-Object System.Collections.ArrayList
+
         foreach ($sourceFile in $sourcePages) {
             if ($MaxPages -gt 0 -and $pagesHandledForLimit -ge $MaxPages) {
                 break
@@ -1875,85 +2450,118 @@ try {
             }
 
             $pagesHandledForLimit++
-            $pageOrdinal = $script:ConvertedThisRun + $script:FailedThisRun + 1
+            [void]$candidates.Add([PSCustomObject]@{
+                SourceFile = $sourceFile
+                SourcePath = [string]$sourceFile.FullName
+                SourceName = [string]$sourceFile.Name
+                SourceRelative = [string]$sourceRelative
+                SourceLength = [long]$sourceFile.Length
+                SourceLastWriteTimeUtcTicks = [long]$sourceFile.LastWriteTimeUtc.Ticks
+                OutputPath = [string]$outputPath
+            })
+        }
 
-            Write-Log -Level "INFO" -Event "page_start" -Message (
-                "Converting $sourceRelative ($((Format-Bytes -Bytes $sourceFile.Length))) using $script:ConverterMode."
-            ) -Data @{
-                source = $sourceRelative
-                sourceBytes = [long]$sourceFile.Length
-                parser = $script:ConverterMode
-                compression = $Compression
-                zipLayout = $ZipLayout
-                compressionLevel = $CompressionLevel
-            }
+        $candidateArray = @($candidates)
+        if ($script:EffectiveParallelism -gt 1 -and $candidateArray.Count -gt 1) {
+            # Largest pages first reduces the chance that one large straggler keeps
+            # the final worker busy after all other workers have gone idle.
+            $candidateArray = @(
+                $candidateArray |
+                    Sort-Object @{ Expression = { [long]$_.SourceLength }; Descending = $true }, SourceRelative
+            )
+        }
 
-            $result = Convert-OnePage -SourceFile $sourceFile -SourceRelative $sourceRelative -OutputPath $outputPath
+        if ($script:EffectiveParallelism -gt 1 -and $candidateArray.Count -gt 0) {
+            $parallelResult = Invoke-ParallelPageConversions -Candidates $candidateArray -ManifestIndex $manifestIndex
+            $newlyConvertedThisScan += [int]$parallelResult.Converted
+            $failedThisScan += [int]$parallelResult.Failed
+        }
+        else {
+            # Original serial path retained for Parallelism=1 and for the
+            # ConvertFrom-Json fallback, which is intentionally not parallelized.
+            foreach ($candidate in $candidateArray) {
+                $sourceFile = $candidate.SourceFile
+                $sourceRelative = [string]$candidate.SourceRelative
+                $outputPath = [string]$candidate.OutputPath
 
-            if (-not $result.Success) {
-                $script:FailedThisRun++
-                $failedThisScan++
-                Write-Log -Level "ERROR" -Event "page_failed" -Message (
-                    "Failed to convert $sourceRelative after $($result.Attempt) attempt(s). It was not checkpointed and will be retried on the next run/scan. $($result.Error)"
+                Write-Log -Level "INFO" -Event "page_start" -Message (
+                    "Converting $sourceRelative ($((Format-Bytes -Bytes $sourceFile.Length))) using $script:ConverterMode."
                 ) -Data @{
                     source = $sourceRelative
-                    attempts = $result.Attempt
-                    error = $result.Error
+                    sourceBytes = [long]$sourceFile.Length
+                    parser = $script:ConverterMode
+                    compression = $Compression
+                    zipLayout = $ZipLayout
+                    compressionLevel = $CompressionLevel
                 }
-                continue
-            }
 
-            $outputInfo = Get-Item -LiteralPath $outputPath
-            $outputRelative = $outputInfo.FullName.Substring($OutputDirectory.TrimEnd('\', '/').Length).TrimStart('\', '/').Replace('/', '\')
+                $result = Convert-OnePage -SourceFile $sourceFile -SourceRelative $sourceRelative -OutputPath $outputPath
 
-            $record = [ordered]@{
-                timestampUtc = (Get-Date).ToUniversalTime().ToString("o")
-                sourceRelative = $sourceRelative
-                sourceLength = [long]$sourceFile.Length
-                sourceLastWriteTimeUtcTicks = [long]$sourceFile.LastWriteTimeUtc.Ticks
-                outputRelative = $outputRelative
-                outputLength = [long]$outputInfo.Length
-                rows = [long]$result.Rows
-                tags = [int]$result.Tags
-                seconds = [double]$result.Seconds
-                attempt = [int]$result.Attempt
-                compression = $Compression
-                zipLayout = $ZipLayout
-                compressionLevel = $CompressionLevel
-                parser = $script:ConverterMode
-            }
+                if (-not $result.Success) {
+                    $script:FailedThisRun++
+                    $failedThisScan++
+                    Write-Log -Level "ERROR" -Event "page_failed" -Message (
+                        "Failed to convert $sourceRelative after $($result.Attempt) attempt(s). It was not checkpointed and will be retried on the next run/scan. $($result.Error)"
+                    ) -Data @{
+                        source = $sourceRelative
+                        attempts = $result.Attempt
+                        error = $result.Error
+                    }
+                    continue
+                }
 
-            Append-ManifestRecord -Record $record
-            $manifestIndex[$sourceRelative] = [PSCustomObject]$record
+                $outputInfo = Get-Item -LiteralPath $outputPath
+                $outputRelative = $outputInfo.FullName.Substring($OutputDirectory.TrimEnd('\', '/').Length).TrimStart('\', '/').Replace('/', '\')
 
-            $script:ConvertedThisRun++
-            $script:RowsThisRun += [long]$result.Rows
-            $script:InputBytesThisRun += [long]$sourceFile.Length
-            $script:OutputBytesThisRun += [long]$result.OutputBytes
-            $newlyConvertedThisScan++
+                $record = [ordered]@{
+                    timestampUtc = (Get-Date).ToUniversalTime().ToString("o")
+                    sourceRelative = $sourceRelative
+                    sourceLength = [long]$sourceFile.Length
+                    sourceLastWriteTimeUtcTicks = [long]$sourceFile.LastWriteTimeUtc.Ticks
+                    outputRelative = $outputRelative
+                    outputLength = [long]$outputInfo.Length
+                    rows = [long]$result.Rows
+                    tags = [int]$result.Tags
+                    seconds = [double]$result.Seconds
+                    attempt = [int]$result.Attempt
+                    compression = $Compression
+                    zipLayout = $ZipLayout
+                    compressionLevel = $CompressionLevel
+                    parser = $script:ConverterMode
+                }
 
-            $rate = 0.0
-            if ($result.Seconds -gt 0) {
-                $rate = $result.Rows / $result.Seconds
-            }
+                Append-ManifestRecord -Record $record
+                $manifestIndex[$sourceRelative] = [PSCustomObject]$record
 
-            Write-Log -Level "DATA" -Event "page_complete" -Message (
-                "$sourceRelative -> $outputRelative | $($result.Rows.ToString('N0')) rows | $($result.Tags) tags | $((Format-Bytes -Bytes $sourceFile.Length)) in -> $((Format-Bytes -Bytes $result.OutputBytes)) out | $([Math]::Round($result.Seconds, 2))s | $([Math]::Round($rate, 0).ToString('N0')) rows/s"
-            ) -Data @{
-                source = $sourceRelative
-                output = $outputRelative
-                rows = [long]$result.Rows
-                tags = [int]$result.Tags
-                inputBytes = [long]$sourceFile.Length
-                outputBytes = [long]$result.OutputBytes
-                seconds = [double]$result.Seconds
-                rowsPerSecond = [double]$rate
-                attempt = [int]$result.Attempt
-            }
+                $script:ConvertedThisRun++
+                $script:RowsThisRun += [long]$result.Rows
+                $script:InputBytesThisRun += [long]$sourceFile.Length
+                $script:OutputBytesThisRun += [long]$result.OutputBytes
+                $newlyConvertedThisScan++
 
-            if ($GcEveryPages -gt 0 -and ($script:ConvertedThisRun % $GcEveryPages) -eq 0) {
-                [GC]::Collect()
-                [GC]::WaitForPendingFinalizers()
+                $rate = 0.0
+                if ($result.Seconds -gt 0) {
+                    $rate = $result.Rows / $result.Seconds
+                }
+
+                Write-Log -Level "DATA" -Event "page_complete" -Message (
+                    "$sourceRelative -> $outputRelative | $($result.Rows.ToString('N0')) rows | $($result.Tags) tags | $((Format-Bytes -Bytes $sourceFile.Length)) in -> $((Format-Bytes -Bytes $result.OutputBytes)) out | $([Math]::Round($result.Seconds, 2))s | $([Math]::Round($rate, 0).ToString('N0')) rows/s"
+                ) -Data @{
+                    source = $sourceRelative
+                    output = $outputRelative
+                    rows = [long]$result.Rows
+                    tags = [int]$result.Tags
+                    inputBytes = [long]$sourceFile.Length
+                    outputBytes = [long]$result.OutputBytes
+                    seconds = [double]$result.Seconds
+                    rowsPerSecond = [double]$rate
+                    attempt = [int]$result.Attempt
+                }
+
+                if ($GcEveryPages -gt 0 -and ($script:ConvertedThisRun % $GcEveryPages) -eq 0) {
+                    [GC]::Collect()
+                    [GC]::WaitForPendingFinalizers()
+                }
             }
         }
 
@@ -2035,6 +2643,7 @@ try {
     Write-Host (" Elapsed:             {0}" -f (Format-Duration -Seconds $elapsed)) -ForegroundColor Gray
     Write-Host (" Overall throughput:  {0:N0} rows/s" -f $overallRate) -ForegroundColor Cyan
     Write-Host (" Parser:              {0}" -f $script:ConverterMode) -ForegroundColor Gray
+    Write-Host (" Parallelism:         {0} requested / {1} effective" -f $Parallelism, $script:EffectiveParallelism) -ForegroundColor Gray
     Write-Host (" Output:              {0}" -f $(if ($Compression -eq "Zip" -and $ZipLayout -eq "SingleArchive") { $SingleZipPath } else { $OutputDataDirectory })) -ForegroundColor Gray
     if ($Compression -eq "Zip" -and $ZipLayout -eq "SingleArchive") {
         Write-Host (" Staging:             {0}" -f $SingleZipStagingDataDirectory) -ForegroundColor DarkGray

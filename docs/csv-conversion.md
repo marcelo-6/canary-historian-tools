@@ -8,6 +8,22 @@ Tag,Timestamp,Value,Quality
 
 The converter leaves the original export unchanged.
 
+## Parallel conversion
+
+`-Parallelism` controls how many finalized source pages can be converted at once. The default is `4`.
+
+Parallel conversion is page-level. Each worker owns one source page and one output file. The coordinator writes the manifest after each worker succeeds, which keeps resume behavior simple.
+
+Parallelism is enabled for the compiled streaming parsers. If `-UsePowerShellParser` is selected, or if the converter falls back to PowerShell `ConvertFrom-Json`, effective parallelism is forced to `1` because that parser materializes full pages in memory.
+
+Use `-Parallelism 1` for troubleshooting. Use `2` to `4` when converting while an export is still running. Raise it only when CPU and disk are clearly waiting around.
+
+## Watch mode
+
+`-Watch` repeatedly scans the export directory for finalized pages. This lets conversion run beside a long export. Temporary exporter files are ignored.
+
+In `SingleArchive` mode, watch mode stages CSV pages first, waits for exporter `state.json` to show completion, then builds the final ZIP.
+
 ## `-Compression None`
 
 Writes one plain `.csv` per source page. This helps inspection and can consume substantially more disk space.

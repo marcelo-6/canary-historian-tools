@@ -71,6 +71,26 @@ Parallel export runs multiple batches at once. It does not run multiple pages fr
 | `-RetryFailedOnly` | Off | Processes only batches currently marked failed in `state.json`. | Use it after a mostly complete run when you want to focus on failures. |
 | `-InsecureSkipCertificateCheck` | Off | Skips TLS certificate validation in PowerShell 7+. | Use only for known self-signed internal endpoints. |
 
+## Choosing conversion settings
+
+The converter reads finalized raw pages from the export directory and writes CSV output under `csv-conversion/` by default. It uses a manifest so finished pages can be skipped on the next run.
+
+Parallel conversion is page-level. Each worker reads one raw page and writes one unique output file. Shared checkpoint files stay under the coordinator, so resume still has one durable manifest writer.
+
+| Parameter | Recommended start | What it does | When to change it |
+| --- | --- | --- | --- |
+| `-ExportDirectory` | Required | Points at the completed or in-progress exporter output. | Use the same directory that contains `state.json` and `data/`. |
+| `-OutputDirectory` | `<ExportDirectory>\csv-conversion` | Stores converted CSV files, logs, manifest, and summary. | Use a different directory for a fresh conversion run. |
+| `-Compression` | `Gzip` | Chooses `None`, `Gzip`, or `Zip` output. | Use `None` for fastest local inspection. Use `Gzip` for normal compressed CSV pages. |
+| `-ZipLayout` | `PerFile` | With `Zip`, chooses one ZIP per page or one final archive. | Use `SingleArchive` when you want one ZIP after all pages are staged. |
+| `-CompressionLevel` | `Fastest` for throughput | Applies to Gzip and ZIP output. | Use `Optimal` when final size matters more than conversion time. |
+| `-Parallelism` | `4` | Converts up to this many independent source pages at once. | Raise it when CPU and disk have room. Lower it when conversion competes with export or storage. |
+| `-Watch` | Off | Keeps scanning for new finalized exporter pages. | Use it to convert while a long export is still running. |
+| `-PollSeconds` | `5` | Wait time between watch-mode scans. | Raise it to reduce filesystem chatter. Lower it for quicker pickup. |
+| `-MaxPages` | `0` | Limits pages converted in one run. `0` means unlimited. | Use it for test runs. |
+| `-Force` | Off | Re-converts pages even when the manifest says they are complete. | Use it after changing output expectations or validating a converter fix. |
+| `-UsePowerShellParser` | Off | Forces the slower `ConvertFrom-Json` parser. | Use only for troubleshooting. Parallelism is forced to `1` with this parser. |
+
 ## Why raw JSON first?
 
 A Canary response page is already a lossless representation of the historian data returned by `getTagData2`. Writing that response directly to disk keeps the extraction path simple:
@@ -152,8 +172,12 @@ One compressed CSV per exporter page:
 ```powershell
 .\scripts\Convert-CanaryJsonToCsv.ps1 `
     -ExportDirectory "E:\CanaryExport" `
-    -Compression Gzip
+    -Compression Gzip `
+    -CompressionLevel Fastest `
+    -Parallelism 4
 ```
+
+The converter uses parallel workers by default when a compiled streaming parser is active. If it falls back to PowerShell `ConvertFrom-Json`, it runs serially to avoid multiplying memory use.
 
 One ZIP per exporter page:
 
