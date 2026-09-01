@@ -65,8 +65,36 @@ Describe 'Exporter safety behavior' {
     }
 
     It 'repairs missing or empty checkpoint pages before resume' {
+        $script:exporterContent | Should -Match 'Reset-BatchForReexport'
         $script:exporterContent | Should -Match 'missing or empty page'
         $script:exporterContent | Should -Match '\.Length -le 0'
+    }
+
+    It 'repairs invalid continuation checkpoints before resume' {
+        $script:exporterContent | Should -Match 'Invalid continuation'
+        $script:exporterContent | Should -Match 'checkpoint references an invalid continuation'
+    }
+
+    It 'permits MaxSizePerTag changes by resetting unfinished batches' {
+        $script:exporterContent | Should -Match 'Repair-MaxSizeChange'
+        $script:exporterContent | Should -Match 'MaxSizePerTag changed from'
+        $script:exporterContent | Should -Match 'completed batches were retained'
+    }
+
+    It 'permits ExportBatchSize changes by regrouping unfinished batches' {
+        $script:exporterContent | Should -Match 'Repair-ExportBatchSizeChange'
+        $script:exporterContent | Should -Match 'ExportBatchSize changed from'
+        $script:exporterContent | Should -Match 'Regrouped .* unfinished batch checkpoint'
+    }
+
+    It 'replays raw continuation tokens without nesting them' {
+        $script:exporterContent | Should -Match 'Convert-ContinuationForRequest -Continuation \$Batch\.Continuation'
+        $script:exporterContent | Should -Not -Match '\$body\["continuation"\] = @\(\$Batch\.Continuation\)'
+    }
+
+    It 'normalizes only continuation nulls before raw requests' {
+        $script:exporterContent | Should -Match 'function Convert-ContinuationForRequest'
+        $script:exporterContent | Should -Match 'if \(\$null -eq \$item\) \{ "" \}'
     }
 }
 

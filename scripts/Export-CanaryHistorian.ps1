@@ -364,6 +364,18 @@ function Test-Continuation {
     return $false
 }
 
+function Convert-ContinuationForRequest {
+    param($Continuation)
+
+    if ($null -eq $Continuation) { return $null }
+
+    return @(
+        foreach ($item in @($Continuation)) {
+            if ($null -eq $item) { "" } else { $item }
+        }
+    )
+}
+
 function Get-Batches {
     param(
         [object[]]$Items,
@@ -1387,6 +1399,30 @@ function Get-CanaryCountsResilient {
     }
 }
 
+function Reset-BatchForReexport {
+    param(
+        [Parameter(Mandatory = $true)]$Batch,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    $batchDir = Join-Path $DataDirectory $Batch.Id
+    if (Test-Path -LiteralPath $batchDir) {
+        Remove-Item -LiteralPath $batchDir -Recurse -Force
+    }
+
+    $Batch.Status = "Pending"
+    $Batch.NextPage = 1
+    $Batch.Continuation = $null
+    $Batch.PointsWritten = 0L
+    $Batch.RawBytes = 0L
+    $Batch.CompressedBytes = 0L
+    $Batch.LastError = $null
+
+    Write-Log -Level "WARN" -Event "checkpoint_repair" -Message (
+        "$($Batch.Id) $Reason Resetting this batch and re-exporting it from the beginning."
+    )
+}
+
 function Repair-CheckpointData {
     param([Parameter(Mandatory = $true)]$State)
 
@@ -1397,6 +1433,12 @@ function Repair-CheckpointData {
         Remove-Item -Force -ErrorAction SilentlyContinue
 
     foreach ($batch in $State.Batches) {
+        if ([string]$batch.LastError -match '(?i)Invalid continuation') {
+            Reset-BatchForReexport -Batch $batch -Reason "checkpoint references an invalid continuation."
+            $repaired++
+            continue
+        }
+
         $lastCheckpointedPage = [int]$batch.NextPage - 1
         if ($lastCheckpointedPage -le 0) { continue }
 
@@ -1416,25 +1458,13 @@ function Repair-CheckpointData {
 
             if ($null -eq $existingPage -or $existingPage.Length -le 0) {
                 $missing = $true
-                Write-Log -Level "WARN" -Event "checkpoint_repair" -Message (
-                    "$($batch.Id) checkpoint references missing or empty page $page. Resetting this batch and re-exporting it from the beginning."
-                )
+                $missingReason = "checkpoint references missing or empty page $page."
                 break
             }
         }
 
         if ($missing) {
-            if (Test-Path -LiteralPath $batchDir) {
-                Remove-Item -LiteralPath $batchDir -Recurse -Force
-            }
-
-            $batch.Status = "Pending"
-            $batch.NextPage = 1
-            $batch.Continuation = $null
-            $batch.PointsWritten = 0L
-            $batch.RawBytes = 0L
-            $batch.CompressedBytes = 0L
-            $batch.LastError = $null
+            Reset-BatchForReexport -Batch $batch -Reason $missingReason
             $repaired++
         }
     }
@@ -1453,14 +1483,143 @@ function Assert-ResumeCompatibility {
     if ([string]$State.Server -ne [string]$Server) { [void]$mismatches.Add("Server") }
     if ([string]$State.Path -ne [string]$Path) { [void]$mismatches.Add("Path") }
     if ([string]$State.ExcludeRegex -ne [string]$ExcludeRegex) { [void]$mismatches.Add("ExcludeRegex") }
-    if ([int]$State.ExportBatchSize -ne [int]$ExportBatchSize) { [void]$mismatches.Add("ExportBatchSize") }
-    if ([int]$State.MaxSizePerTag -ne [int]$MaxSizePerTag) { [void]$mismatches.Add("MaxSizePerTag") }
     if ($null -ne $State.PSObject.Properties["CountBucketDays"] -and [int]$State.CountBucketDays -ne [int]$CountBucketDays) { [void]$mismatches.Add("CountBucketDays") }
     if ([bool]$State.IncludeQuality -ne [bool]$IncludeQuality) { [void]$mismatches.Add("IncludeQuality") }
 
     if ($mismatches.Count -gt 0) {
         throw "Existing state.json does not match current options: $($mismatches -join ', '). Use the original options or a different OutputDirectory."
     }
+}
+
+function Repair-MaxSizeChange {
+    param([Parameter(Mandatory = $true)]$State)
+
+    if ($null -eq $State.PSObject.Properties["MaxSizePerTag"]) {
+        $State | Add-Member -NotePropertyName MaxSizePerTag -NotePropertyValue $MaxSizePerTag
+        return
+    }
+
+    $previousMaxSizePerTag = [int]$State.MaxSizePerTag
+    if ($previousMaxSizePerTag -eq [int]$MaxSizePerTag) { return }
+
+    $resetCount = 0
+    foreach ($batch in @($State.Batches)) {
+        if ($batch.Status -eq "Complete" -or $batch.Status -eq "Unavailable") {
+            continue
+        }
+
+        Reset-BatchForReexport -Batch $batch -Reason (
+            "was unfinished after MaxSizePerTag changed from $previousMaxSizePerTag to $MaxSizePerTag."
+        )
+        $resetCount++
+    }
+
+    $State.MaxSizePerTag = $MaxSizePerTag
+    Save-State -State $State
+
+    Write-Log -Level "WARN" -Event "resume_max_size_changed" -Message (
+        "MaxSizePerTag changed from $previousMaxSizePerTag to $MaxSizePerTag. Reset $resetCount unfinished batch checkpoint(s); completed batches were retained."
+    )
+}
+
+function New-ExportBatchRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][object[]]$Tags,
+        [Parameter(Mandatory = $true)][string]$StartTime,
+        [Parameter(Mandatory = $true)][string]$EndTime
+    )
+
+    [PSCustomObject]@{
+        Id = $Id
+        Kind = $Kind
+        Tags = @($Tags)
+        StartTime = $StartTime
+        EndTime = $EndTime
+        Status = "Pending"
+        NextPage = 1
+        Continuation = $null
+        PointsWritten = 0L
+        RawBytes = 0L
+        CompressedBytes = 0L
+        LastError = $null
+    }
+}
+
+function Repair-ExportBatchSizeChange {
+    param([Parameter(Mandatory = $true)]$State)
+
+    if ($null -eq $State.PSObject.Properties["ExportBatchSize"]) {
+        $State | Add-Member -NotePropertyName ExportBatchSize -NotePropertyValue $ExportBatchSize
+        return
+    }
+
+    $previousExportBatchSize = [int]$State.ExportBatchSize
+    if ($previousExportBatchSize -eq [int]$ExportBatchSize) { return }
+
+    $retainedBatches = @($State.Batches | Where-Object { $_.Status -eq "Complete" -or $_.Status -eq "Unavailable" })
+    $unfinishedBatches = @($State.Batches | Where-Object { $_.Status -ne "Complete" -and $_.Status -ne "Unavailable" })
+
+    foreach ($batch in $unfinishedBatches) {
+        $batchDir = Join-Path $DataDirectory $batch.Id
+        if (Test-Path -LiteralPath $batchDir) {
+            Remove-Item -LiteralPath $batchDir -Recurse -Force
+        }
+    }
+
+    $newBatches = New-Object System.Collections.ArrayList
+    $batchId = 0
+
+    foreach ($batch in $retainedBatches) {
+        [void]$newBatches.Add($batch)
+        if ([string]$batch.Id -match '^[BU](\d+)$') {
+            $batchId = [Math]::Max($batchId, [int]$Matches[1])
+        }
+    }
+
+    $resolvedGroups = @(
+        $unfinishedBatches |
+        Where-Object { $_.Kind -eq "resolved" } |
+        Group-Object StartTime, EndTime
+    )
+
+    foreach ($group in $resolvedGroups) {
+        $firstGroupBatch = @($group.Group)[0]
+        $startTime = [string]$firstGroupBatch.StartTime
+        $endTime = [string]$firstGroupBatch.EndTime
+        $tags = @($group.Group | ForEach-Object { @($_.Tags) })
+
+        foreach ($tagBatch in Get-Batches -Items $tags -Size $ExportBatchSize) {
+            $batchId++
+            [void]$newBatches.Add((New-ExportBatchRecord `
+                -Id ("B{0:D5}" -f $batchId) `
+                -Kind "resolved" `
+                -Tags @($tagBatch) `
+                -StartTime $startTime `
+                -EndTime $endTime))
+        }
+    }
+
+    foreach ($batch in @($unfinishedBatches | Where-Object { $_.Kind -ne "resolved" })) {
+        foreach ($tag in @($batch.Tags)) {
+            $batchId++
+            [void]$newBatches.Add((New-ExportBatchRecord `
+                -Id ("U{0:D5}" -f $batchId) `
+                -Kind $batch.Kind `
+                -Tags @([string]$tag) `
+                -StartTime ([string]$batch.StartTime) `
+                -EndTime ([string]$batch.EndTime)))
+        }
+    }
+
+    $State.Batches = @($newBatches)
+    $State.ExportBatchSize = $ExportBatchSize
+    Save-State -State $State
+
+    Write-Log -Level "WARN" -Event "resume_batch_size_changed" -Message (
+        "ExportBatchSize changed from $previousExportBatchSize to $ExportBatchSize. Regrouped $($unfinishedBatches.Count) unfinished batch checkpoint(s); completed batches were retained."
+    )
 }
 
 function Add-PlanCount {
@@ -2007,7 +2166,7 @@ function Export-Batch {
         }
 
         if (Test-Continuation $Batch.Continuation) {
-            $body["continuation"] = @($Batch.Continuation)
+            $body["continuation"] = Convert-ContinuationForRequest -Continuation $Batch.Continuation
         }
 
         try {
@@ -2336,6 +2495,8 @@ if (Test-Path -LiteralPath $StatePath) {
     Write-Log -Level "INFO" -Event "resume_detected" -Message "Existing checkpoint found; validating and resuming."
     $state = (Get-Content -LiteralPath $StatePath -Raw) | ConvertFrom-Json
     Assert-ResumeCompatibility -State $state
+    Repair-ExportBatchSizeChange -State $state
+    Repair-MaxSizeChange -State $state
 
     # Output storage may be changed when resuming because each page is self-contained.
     # Existing .json.gz pages remain valid while new pages can be written as raw .json,
