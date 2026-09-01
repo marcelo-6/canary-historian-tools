@@ -1,0 +1,9 @@
+{
+  "statusCode": "NoLicense",
+  "errors": [
+    "GetAggregateDataAsync",
+    "Status code 'NoLicense'"
+  ],
+  "data": {},
+  "continuation": []
+}

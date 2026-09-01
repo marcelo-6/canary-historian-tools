@@ -150,7 +150,8 @@
 
     If Json.NET is unavailable in the current PowerShell host, the script falls back to
     ConvertFrom-Json and reports that choice in the console. The fallback generally uses more memory
-    and CPU.
+    and CPU. By default, the PowerShell fallback refuses source pages larger than 10 MB. Use
+    -PowerShellParserMaxInputMB 0 to permit larger fallback conversions deliberately.
 
     -CompressionLevel controls GZIP and ZIP compression and accepts Fastest or Optimal.
     Fastest is useful when conversion throughput matters more than squeezing the final archive size.
@@ -251,6 +252,10 @@ param(
 
     # Force the PowerShell object-model parser and skip compiled streaming parsers.
     [switch]$UsePowerShellParser,
+
+    # Safety limit for the ConvertFrom-Json fallback. 0 permits any source size.
+    [ValidateRange(0, 102400)]
+    [int]$PowerShellParserMaxInputMB = 10,
 
     # Number of successfully converted pages between explicit garbage collections.
     # Mainly relevant to the PowerShell parser fallback. 0 disables explicit GC.
@@ -1295,6 +1300,9 @@ function Test-AlreadyConverted {
 
     if ([long]$record.sourceLength -ne [long]$SourceFile.Length) { return $false }
     if ([long]$record.sourceLastWriteTimeUtcTicks -ne [long]$SourceFile.LastWriteTimeUtc.Ticks) { return $false }
+    if ([string]$record.compression -ne [string]$Compression) { return $false }
+    if ([string]$record.zipLayout -ne [string]$ZipLayout) { return $false }
+    if ([string]$record.compressionLevel -ne [string]$CompressionLevel) { return $false }
 
     return $true
 }
@@ -1444,6 +1452,15 @@ function Convert-OnePage {
                 $stats = [CanaryCsvBuiltInStreamingConverter]::Convert($inputPayloadStream, $outputPayloadStream, ',')
             }
             else {
+                if ($PowerShellParserMaxInputMB -gt 0) {
+                    if ($SourceFile.Name.EndsWith(".json.gz", [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw "Fast streaming parser unavailable. Refusing ConvertFrom-Json fallback for compressed source page $($SourceFile.Name). Use -PowerShellParserMaxInputMB 0 to permit it deliberately."
+                    }
+
+                    if ($SourceFile.Length -gt ($PowerShellParserMaxInputMB * 1MB)) {
+                        throw "Fast streaming parser unavailable. Source page is $((Format-Bytes -Bytes $SourceFile.Length)). Refusing ConvertFrom-Json fallback above $PowerShellParserMaxInputMB MB."
+                    }
+                }
                 $stats = Convert-PageWithPowerShell -InputStream $inputPayloadStream -OutputStream $outputPayloadStream
             }
 

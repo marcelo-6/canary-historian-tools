@@ -53,10 +53,20 @@ Describe 'Exporter safety behavior' {
         $script:exporterContent | Should -Match 'Export plan validated'
     }
 
+    It 'applies exclusion regex case-sensitively' {
+        $script:exporterContent | Should -Match '-cmatch \$ExcludeRegex'
+        $script:exporterContent | Should -Match '-cnotmatch \$ExcludeRegex'
+    }
+
     It 'keeps Count failures separate from export eligibility' {
         $script:exporterContent | Should -Match 'Test-SystemicCountFailure'
         $script:exporterContent | Should -Match 'Raw export eligibility is unaffected'
         $script:exporterContent | Should -Match '-Attempts 1'
+    }
+
+    It 'repairs missing or empty checkpoint pages before resume' {
+        $script:exporterContent | Should -Match 'missing or empty page'
+        $script:exporterContent | Should -Match '\.Length -le 0'
     }
 }
 
@@ -76,5 +86,57 @@ Describe 'Converter output modes' {
 
     It 'contains a compiled streaming fallback' {
         $script:converterContent | Should -Match 'Compiled built-in \.NET streaming parser enabled'
+    }
+
+    It 'guards large ConvertFrom-Json fallback usage' {
+        $script:converterContent | Should -Match 'PowerShellParserMaxInputMB'
+        $script:converterContent | Should -Match 'Refusing ConvertFrom-Json fallback'
+        $script:converterContent | Should -Match 'compressed source page'
+    }
+
+    It 'invalidates checkpoints when output settings change' {
+        $script:converterContent | Should -Match 'record\.compression'
+        $script:converterContent | Should -Match 'record\.zipLayout'
+        $script:converterContent | Should -Match 'record\.compressionLevel'
+    }
+}
+
+Describe 'Benchmark safety behavior' {
+    BeforeAll {
+        $script:repoRoot = Split-Path -Parent $PSScriptRoot
+        $script:benchmarkContent = Get-Content -Path (Join-Path $script:repoRoot 'scripts/Benchmark-CanaryHistorian.ps1') -Raw
+    }
+
+    It 'records malformed or omitted context rows as skipped tags' {
+        $script:benchmarkContent | Should -Match 'Add-BadContextTag'
+        $script:benchmarkContent | Should -Match 'Context response omitted tag'
+        $script:benchmarkContent | Should -Match 'Context response duplicated tag'
+        $script:benchmarkContent | Should -Match 'missing oldestTimeStamp or latestTimeStamp'
+    }
+}
+
+Describe 'Offline fixtures' {
+    BeforeAll {
+        $script:repoRoot = Split-Path -Parent $PSScriptRoot
+        $script:fixtureDirectory = Join-Path $script:repoRoot 'tests/fixtures'
+        $script:fixtures = @(
+            'context-good.json'
+            'context-missing-tag.json'
+            'context-null-timestamp.json'
+            'raw-good.json'
+            'raw-empty.json'
+            'raw-continuation.json'
+            'raw-no-trend-vectors.json'
+            'aggregate-no-license.json'
+            'string-values.json'
+        )
+    }
+
+    It 'contains valid JSON fixture files' {
+        foreach ($fixture in $script:fixtures) {
+            $path = Join-Path $script:fixtureDirectory $fixture
+            Test-Path $path | Should -BeTrue
+            { Get-Content -Path $path -Raw | ConvertFrom-Json } | Should -Not -Throw
+        }
     }
 }

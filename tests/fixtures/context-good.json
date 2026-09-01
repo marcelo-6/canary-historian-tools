@@ -1,0 +1,13 @@
+{
+  "statusCode": "Good",
+  "errors": [],
+  "data": [
+    {
+      "tagName": "HIST_DATA.TagA",
+      "tagContext": {
+        "oldestTimeStamp": "2025-06-01T00:00:00.0000000Z",
+        "latestTimeStamp": "2026-09-01T00:00:00.0000000Z"
+      }
+    }
+  ]
+}

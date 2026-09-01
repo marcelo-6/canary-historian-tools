@@ -413,6 +413,19 @@ function Get-PointValue {
 $badContextTags = [System.Collections.Generic.List[object]]::new()
 $badCountTags = [System.Collections.Generic.List[object]]::new()
 
+function Add-BadContextTag {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [Parameter(Mandatory = $true)][string]$Error
+    )
+
+    Write-Log -Level "SKIP" -Message "Context unavailable: $Tag"
+    $badContextTags.Add([PSCustomObject]@{
+        Tag   = $Tag
+        Error = $Error
+    })
+}
+
 function Get-CanaryTagContextResilient {
     param(
         [Parameter(Mandatory = $true)]
@@ -431,23 +444,61 @@ function Get-CanaryTagContextResilient {
     } -AllowApiError
 
     if (([string]$result.Data.statusCode) -eq "Good") {
+        $returnedTags = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::Ordinal)
+
         foreach ($item in @($result.Data.data)) {
+            $tagName = [string]$item.tagName
+            if ([string]::IsNullOrWhiteSpace($tagName)) {
+                continue
+            }
+
+            if (-not $returnedTags.Add($tagName)) {
+                Add-BadContextTag -Tag $tagName -Error "Context response duplicated tag"
+                continue
+            }
+
             $oldest = $null
             $latest = $null
 
-            if ($item.tagContext.oldestTimeStamp) {
-                $oldest = [DateTimeOffset]::Parse([string]$item.tagContext.oldestTimeStamp)
+            if ($null -eq $item.tagContext) {
+                Add-BadContextTag -Tag $tagName -Error "Context response missing tagContext"
+                continue
             }
 
-            if ($item.tagContext.latestTimeStamp) {
-                $latest = [DateTimeOffset]::Parse([string]$item.tagContext.latestTimeStamp)
+            $oldestText = [string]$item.tagContext.oldestTimeStamp
+            $latestText = [string]$item.tagContext.latestTimeStamp
+
+            if ([string]::IsNullOrWhiteSpace($oldestText) -or [string]::IsNullOrWhiteSpace($latestText)) {
+                Add-BadContextTag -Tag $tagName -Error "Context response missing oldestTimeStamp or latestTimeStamp"
+                continue
+            }
+
+            try {
+                $oldest = [DateTimeOffset]::Parse($oldestText)
+                $latest = [DateTimeOffset]::Parse($latestText)
+            }
+            catch {
+                Add-BadContextTag -Tag $tagName -Error "Context response has malformed timestamp: $($_.Exception.Message)"
+                continue
+            }
+
+            if ($latest -lt $oldest) {
+                Add-BadContextTag -Tag $tagName -Error "Context response latestTimeStamp is earlier than oldestTimeStamp"
+                continue
             }
 
             [PSCustomObject]@{
-                Tag    = [string]$item.tagName
+                Tag    = $tagName
                 Oldest = $oldest
                 Latest = $latest
                 Count  = $null
+            }
+        }
+
+        foreach ($tag in $Tags) {
+            $tagName = [string]$tag
+            if (-not $returnedTags.Contains($tagName)) {
+                Add-BadContextTag -Tag $tagName -Error "Context response omitted tag"
             }
         }
 
@@ -462,12 +513,7 @@ function Get-CanaryTagContextResilient {
 
     if ($tagCount -eq 1) {
         $tag = [string]$Tags[0]
-        Write-Log -Level "SKIP" -Message "Context unavailable: $tag"
-
-        $badContextTags.Add([PSCustomObject]@{
-            Tag   = $tag
-            Error = $errorText
-        })
+        Add-BadContextTag -Tag $tag -Error $errorText
         return
     }
 
@@ -684,7 +730,7 @@ $excludedTags = @()
 if (-not $IncludeDiagnostics) {
     $excludedTags = @(
         $allTags |
-        Where-Object { $_ -match '\{Diagnostics\}' } |
+        Where-Object { $_ -cmatch '\{Diagnostics\}' } |
         ForEach-Object {
             [PSCustomObject]@{
                 Tag    = $_
@@ -693,7 +739,7 @@ if (-not $IncludeDiagnostics) {
         }
     )
 
-    $includedTags = @($allTags | Where-Object { $_ -notmatch '\{Diagnostics\}' })
+    $includedTags = @($allTags | Where-Object { $_ -cnotmatch '\{Diagnostics\}' })
 }
 else {
     $includedTags = @($allTags)

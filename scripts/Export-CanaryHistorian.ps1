@@ -1173,7 +1173,7 @@ function Get-CanaryTagContextResilient {
             tags = @($Tags)
         } -Operation "getTagContext ($($Tags.Count) tags)"
 
-        $returnedTags = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        $returnedTags = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::Ordinal)
 
         foreach ($item in @($result.Parsed.data)) {
             $oldest = $null
@@ -1406,10 +1406,18 @@ function Repair-CheckpointData {
         for ($page = 1; $page -le $lastCheckpointedPage; $page++) {
             $expectedRaw = Join-Path $batchDir ("page-{0:D6}.json" -f $page)
             $expectedGzip = Join-Path $batchDir ("page-{0:D6}.json.gz" -f $page)
-            if (-not (Test-Path -LiteralPath $expectedRaw) -and -not (Test-Path -LiteralPath $expectedGzip)) {
+            $existingPage = $null
+            if (Test-Path -LiteralPath $expectedRaw) {
+                $existingPage = Get-Item -LiteralPath $expectedRaw -ErrorAction SilentlyContinue
+            }
+            elseif (Test-Path -LiteralPath $expectedGzip) {
+                $existingPage = Get-Item -LiteralPath $expectedGzip -ErrorAction SilentlyContinue
+            }
+
+            if ($null -eq $existingPage -or $existingPage.Length -le 0) {
                 $missing = $true
                 Write-Log -Level "WARN" -Event "checkpoint_repair" -Message (
-                    "$($batch.Id) checkpoint references missing page $page. Resetting this batch and re-exporting it from the beginning."
+                    "$($batch.Id) checkpoint references missing or empty page $page. Resetting this batch and re-exporting it from the beginning."
                 )
                 break
             }
@@ -1588,6 +1596,7 @@ function New-ExportPlan {
             Latest = $(if ($null -ne $context -and $null -ne $context.Latest) { $context.Latest.ToString("o") } else { "" })
             Count = $countValue
             CountStatus = $countStatus
+            RawExportStatus = "Pending"
         }
     }
 }
@@ -1722,8 +1731,8 @@ function New-ExportState {
     while (Test-Continuation $continuation)
 
     $allTags = @(Get-UniqueStringsOrdinal -Items $allTagsList.ToArray())
-    $excluded = @($allTags | Where-Object { $_ -match $ExcludeRegex })
-    $included = @($allTags | Where-Object { $_ -notmatch $ExcludeRegex })
+    $excluded = @($allTags | Where-Object { $_ -cmatch $ExcludeRegex })
+    $included = @($allTags | Where-Object { $_ -cnotmatch $ExcludeRegex })
 
     $excluded | ForEach-Object {
         [PSCustomObject]@{ Tag = $_; Reason = "Matched exclusion regex: $ExcludeRegex" }
@@ -2200,10 +2209,23 @@ function Write-FinalSummary {
     $points = 0L
     $rawBytes = 0L
     $compressedBytes = 0L
+    $plannedTags = 0
+    $completeTags = 0
+    $failedTags = 0
+    $unavailableTags = 0
+    $pendingTags = 0
+
     foreach ($batch in $State.Batches) {
+        $batchTagCount = @($batch.Tags).Count
         $points += [long]$batch.PointsWritten
         $rawBytes += [long]$batch.RawBytes
         $compressedBytes += [long]$batch.CompressedBytes
+        $plannedTags += $batchTagCount
+
+        if ($batch.Status -eq "Complete") { $completeTags += $batchTagCount }
+        elseif ($batch.Status -eq "Failed") { $failedTags += $batchTagCount }
+        elseif ($batch.Status -eq "Unavailable") { $unavailableTags += $batchTagCount }
+        else { $pendingTags += $batchTagCount }
     }
 
     if ($failed.Count -gt 0) {
@@ -2232,6 +2254,11 @@ function Write-FinalSummary {
         failedBatches = $failed.Count
         unavailableBatches = $unavailable.Count
         pendingBatches = $pending.Count
+        plannedTags = $plannedTags
+        completeTags = $completeTags
+        unavailableTags = $unavailableTags
+        failedTags = $failedTags
+        pendingTags = $pendingTags
         pointsWritten = $points
         pointsWrittenThisRun = $runPoints
         expectedPointsFromCount = [double]$State.ExpectedPoints
@@ -2259,6 +2286,10 @@ function Write-FinalSummary {
     Write-Host (" Complete batches:   {0:N0}/{1:N0}" -f $complete.Count, @($State.Batches).Count) -ForegroundColor Green
     Write-Host (" Failed batches:     {0:N0}" -f $failed.Count) -ForegroundColor $(if ($failed.Count -eq 0) { "Green" } else { "Red" })
     Write-Host (" Unavailable tags:   {0:N0}" -f $unavailable.Count) -ForegroundColor $(if ($unavailable.Count -eq 0) { "Green" } else { "Yellow" })
+    Write-Host (" Planned tags:       {0:N0}" -f $plannedTags) -ForegroundColor White
+    Write-Host (" Complete tags:      {0:N0}" -f $completeTags) -ForegroundColor White
+    Write-Host (" Failed tags:        {0:N0}" -f $failedTags) -ForegroundColor $(if ($failedTags -eq 0) { "Green" } else { "Red" })
+    Write-Host (" Pending tags:       {0:N0}" -f $pendingTags) -ForegroundColor $(if ($pendingTags -eq 0) { "Green" } else { "Yellow" })
     Write-Host (" TVQs written:       {0:N0}" -f $points) -ForegroundColor White
     Write-Host (" TVQs this run:      {0:N0}" -f $runPoints) -ForegroundColor White
     Write-Host (" Raw API data:       {0:N2} GB" -f ($rawBytes / 1GB)) -ForegroundColor White
