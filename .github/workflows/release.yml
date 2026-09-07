@@ -18,7 +18,7 @@ jobs:
 
       - name: Cache PowerShell modules
         id: cache-powershell-modules
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/Documents/PowerShell/Modules
           key: ${{ runner.os }}-powershell-7-modules-PSScriptAnalyzer-1.25.0-Pester-5.9.0
