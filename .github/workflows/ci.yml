@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Typos
-        uses: crate-ci/typos@v1.50.0
+        uses: crate-ci/typos@v1.50.2
       - name: Links
         uses: lycheeverse/lychee-action@v2
         with:
